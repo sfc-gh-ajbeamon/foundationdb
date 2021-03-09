@@ -24,6 +24,7 @@
 
 #include <ctime>
 #include "flow/flow.h"
+#include "fdbrpc/IRateControl.h"
 
 // All outstanding operations must be cancelled before the destructor of IAsyncFile is called.
 // The desirability of the above semantic is disputed. Some classes (AsyncFileS3BlobStore,
@@ -81,6 +82,10 @@ public:
 	virtual void releaseZeroCopy( void* data, int length, int64_t offset ) {}
 
 	virtual int64_t debugFD() const = 0;
+
+	// Used for rate control, at present, only AsyncFileCached supports it
+	virtual Reference<IRateControl> const& getRateControl() { throw unsupported_operation(); }
+	virtual void setRateControl(Reference<IRateControl> const& rc) { throw unsupported_operation(); }
 };
 
 typedef void (*runCycleFuncPtr)();
@@ -88,17 +93,17 @@ typedef void (*runCycleFuncPtr)();
 class IAsyncFileSystem {
 public:
 	// Opens a file for asynchronous I/O
-	virtual Future< Reference<class IAsyncFile> > open( std::string filename, int64_t flags, int64_t mode ) = 0;
+	virtual Future<Reference<class IAsyncFile>> open(const std::string& filename, int64_t flags, int64_t mode) = 0;
 
 	// Deletes the given file.  If mustBeDurable, returns only when the file is guaranteed to be deleted even after a power failure.
-	virtual Future< Void > deleteFile( std::string filename, bool mustBeDurable ) = 0;
+	virtual Future<Void> deleteFile(const std::string& filename, bool mustBeDurable) = 0;
 
 	// Unlinks a file and then deletes it slowly by truncating the file repeatedly.
 	// If mustBeDurable, returns only when the file is guaranteed to be deleted even after a power failure.
-	virtual Future<Void> incrementalDeleteFile( std::string filename, bool mustBeDurable );
+	virtual Future<Void> incrementalDeleteFile(const std::string& filename, bool mustBeDurable);
 
 	// Returns the time of the last modification of the file.
-	virtual Future<std::time_t> lastWriteTime( std::string filename ) = 0;
+	virtual Future<std::time_t> lastWriteTime(const std::string& filename) = 0;
 
 	static IAsyncFileSystem* filesystem() { return filesystem(g_network); }
 	static runCycleFuncPtr runCycleFunc() { return reinterpret_cast<runCycleFuncPtr>(reinterpret_cast<flowGlobalType>(g_network->global(INetwork::enRunCycleFunc))); }

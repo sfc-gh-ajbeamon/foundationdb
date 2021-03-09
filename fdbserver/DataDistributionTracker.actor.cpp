@@ -94,7 +94,7 @@ struct DataDistributionTracker {
 	// The reference to trackerCancelled must be extracted by actors,
 	// because by the time (trackerCancelled == true) this memory cannot
 	// be accessed
-	bool const& trackerCancelled;
+	bool& trackerCancelled;
 
 	// This class extracts the trackerCancelled reference from a DataDistributionTracker object
 	// Because some actors spawned by the dataDistributionTracker outlive the DataDistributionTracker
@@ -123,7 +123,7 @@ struct DataDistributionTracker {
 	                        PromiseStream<RelocateShard> const& output,
 	                        Reference<ShardsAffectedByTeamFailure> shardsAffectedByTeamFailure,
 	                        Reference<AsyncVar<bool>> anyZeroHealthyTeams, KeyRangeMap<ShardTrackedData>& shards,
-	                        bool const& trackerCancelled)
+	                        bool& trackerCancelled)
 	  : cx(cx), distributorId(distributorId), dbSizeEstimate(new AsyncVar<int64_t>()), systemSizeEstimate(0),
 	    maxShardSize(new AsyncVar<Optional<int64_t>>()), sizeChanges(false), readyToStart(readyToStart), output(output),
 	    shardsAffectedByTeamFailure(shardsAffectedByTeamFailure), anyZeroHealthyTeams(anyZeroHealthyTeams),
@@ -131,6 +131,7 @@ struct DataDistributionTracker {
 
 	~DataDistributionTracker()
 	{
+		trackerCancelled = true;
 		//Cancel all actors so they aren't waiting on sizeChanged broken promise
 		sizeChanges.clear(false);
 	}
@@ -319,7 +320,7 @@ ACTOR Future<Void> readHotDetector(DataDistributionTracker* self) {
 			loop {
 				try {
 					Standalone<VectorRef<ReadHotRangeWithMetrics>> readHotRanges = wait(tr.getReadHotRanges(keys));
-					for (auto& keyRange : readHotRanges) {
+					for (const auto& keyRange : readHotRanges) {
 						TraceEvent("ReadHotRangeLog")
 						    .detail("ReadDensity", keyRange.density)
 						    .detail("ReadBandwidth", keyRange.readBandwidth)
@@ -394,12 +395,14 @@ ACTOR Future<Void> changeSizes( DataDistributionTracker* self, KeyRange keys, in
 	wait( yield(TaskPriority::DataDistribution) );
 
 	int64_t newShardsStartingSize = 0;
-	for ( int i = 0; i < sizes.size(); i++ )
-		newShardsStartingSize += sizes[i].get();
+	for (const auto& size : sizes) {
+		newShardsStartingSize += size.get();
+	}
 
 	int64_t newSystemShardsStartingSize = 0;
-	for ( int i = 0; i < systemSizes.size(); i++ )
-		newSystemShardsStartingSize += systemSizes[i].get();
+	for (const auto& systemSize : systemSizes) {
+		newSystemShardsStartingSize += systemSize.get();
+	}
 
 	int64_t totalSizeEstimate = self->dbSizeEstimate->get();
 	/*TraceEvent("TrackerChangeSizes")
@@ -901,7 +904,7 @@ ACTOR Future<Void> dataDistributionTracker(Reference<InitialDataDistribution> in
                                            FutureStream<Promise<int64_t>> getAverageShardBytes,
                                            Promise<Void> readyToStart, Reference<AsyncVar<bool>> anyZeroHealthyTeams,
                                            UID distributorId, KeyRangeMap<ShardTrackedData>* shards,
-                                           bool const* trackerCancelled) {
+                                           bool* trackerCancelled) {
 	state DataDistributionTracker self(cx, distributorId, readyToStart, output, shardsAffectedByTeamFailure,
 	                                   anyZeroHealthyTeams, *shards, *trackerCancelled);
 	state Future<Void> loggingTrigger = Void();
@@ -944,13 +947,14 @@ vector<KeyRange> ShardsAffectedByTeamFailure::getShardsFor( Team team ) {
 	return r;
 }
 
-bool ShardsAffectedByTeamFailure::hasShards(Team team) {
+bool ShardsAffectedByTeamFailure::hasShards(Team team) const {
 	auto it = team_shards.lower_bound(std::pair<Team, KeyRange>(team, KeyRangeRef()));
 	return it != team_shards.end() && it->first == team;
 }
 
-int ShardsAffectedByTeamFailure::getNumberOfShards( UID ssID ) {
-	return storageServerShards[ssID];
+int ShardsAffectedByTeamFailure::getNumberOfShards(UID ssID) const {
+	auto it = storageServerShards.find(ssID);
+	return it == storageServerShards.end() ? 0 : it->second;
 }
 
 std::pair<vector<ShardsAffectedByTeamFailure::Team>,vector<ShardsAffectedByTeamFailure::Team>> ShardsAffectedByTeamFailure::getTeamsFor( KeyRangeRef keys ) {

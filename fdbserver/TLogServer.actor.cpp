@@ -619,7 +619,7 @@ struct LogData : NonCopyable, public ReferenceCounted<LogData> {
 		specialCounter(cc, "QueueDiskBytesTotal", [tLogData](){ return tLogData->rawPersistentQueue->getStorageBytes().total; });
 		specialCounter(cc, "PeekMemoryReserved", [tLogData]() { return tLogData->peekMemoryLimiter.activePermits(); });
 		specialCounter(cc, "PeekMemoryRequestsStalled", [tLogData]() { return tLogData->peekMemoryLimiter.waiters(); });
-		specialCounter(cc, "Geneartion", [this]() { return this->recoveryCount; });
+		specialCounter(cc, "Generation", [this]() { return this->recoveryCount; });
 	}
 
 	~LogData() {
@@ -1096,18 +1096,13 @@ ACTOR Future<Void> processPopRequests(TLogData* self, Reference<LogData> logData
 		}
 	}
 	wait(waitForAll(ignoredPops));
+	TraceEvent("ResetIgnorePopRequest")
+	    .detail("IgnorePopRequest", self->ignorePopRequest)
+	    .detail("IgnorePopDeadline", self->ignorePopDeadline);
 	return Void();
 }
 
 ACTOR Future<Void> tLogPop( TLogData* self, TLogPopRequest req, Reference<LogData> logData ) {
-	// timeout check for ignorePopRequest
-	if (self->ignorePopRequest && (g_network->now() > self->ignorePopDeadline)) {
-		TraceEvent("EnableTLogPlayAllIgnoredPops").detail("IgnoredPopDeadline", self->ignorePopDeadline);
-		wait(processPopRequests(self, logData));
-		TraceEvent("ResetIgnorePopRequest")
-		    .detail("IgnorePopRequest", self->ignorePopRequest)
-		    .detail("IgnorePopDeadline", self->ignorePopDeadline);
-	}
 	if (self->ignorePopRequest) {
 		TraceEvent(SevDebug, "IgnoringPopRequest").detail("IgnorePopDeadline", self->ignorePopDeadline);
 
@@ -1773,19 +1768,6 @@ ACTOR Future<Void> tLogPeekMessages( TLogData* self, TLogPeekRequest req, Refere
 	return Void();
 }
 
-ACTOR Future<Void> watchDegraded(TLogData* self) {
-	if(g_network->isSimulated() && g_simulator.speedUpSimulation) {
-		return Void();
-	}
-	
-	wait(lowPriorityDelay(SERVER_KNOBS->TLOG_DEGRADED_DURATION));
-	
-	TraceEvent(SevWarnAlways, "TLogDegraded", self->dbgid);
-	TEST(true); //TLog degraded
-	self->degraded->set(true);
-	return Void();
-}
-
 ACTOR Future<Void> doQueueCommit( TLogData* self, Reference<LogData> logData, std::vector<Reference<LogData>> missingFinalCommit ) {
 	state Version ver = logData->version.get();
 	state Version commitNumber = self->queueCommitBegin+1;
@@ -1798,12 +1780,11 @@ ACTOR Future<Void> doQueueCommit( TLogData* self, Reference<LogData> logData, st
 	self->diskQueueCommitBytes = 0;
 	self->largeDiskQueueCommitBytes.set(false);
 
-	state Future<Void> degraded = watchDegraded(self);
-	wait(c);
+	wait(ioDegradedOrTimeoutError(c, SERVER_KNOBS->MAX_STORAGE_COMMIT_TIME, self->degraded,
+	                              SERVER_KNOBS->TLOG_DEGRADED_DURATION));
 	if(g_network->isSimulated() && !g_simulator.speedUpSimulation && BUGGIFY_WITH_PROB(0.0001)) {
 		wait(delay(6.0));
 	}
-	degraded.cancel();
 	wait(self->queueCommitEnd.whenAtLeast(commitNumber-1));
 
 	//Calling check_yield instead of yield to avoid a destruction ordering problem in simulation
@@ -2291,6 +2272,11 @@ ACTOR Future<Void> serveTLogInterface( TLogData* self, TLogInterface tli, Refere
 		}
 		when( TLogSnapRequest snapReq = waitNext( tli.snapRequest.getFuture() ) ) {
 			logData->addActor.send( tLogSnapCreate( snapReq, self, logData) );
+		}
+		when(wait(self->ignorePopRequest ? delayUntil(self->ignorePopDeadline) : Never())) {
+			TEST(true); // Hit ignorePopDeadline
+			TraceEvent("EnableTLogPlayAllIgnoredPops").detail("IgnoredPopDeadline", self->ignorePopDeadline);
+			logData->addActor.send(processPopRequests(self, logData));
 		}
 	}
 }

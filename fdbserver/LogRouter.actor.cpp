@@ -182,7 +182,7 @@ void commitMessages( LogRouterData* self, Version version, const std::vector<Tag
 	}
 
 	int msgSize = 0;
-	for(auto& i : taggedMessages) {
+	for (const auto& i : taggedMessages) {
 		msgSize += i.message.size();
 	}
 
@@ -199,7 +199,7 @@ void commitMessages( LogRouterData* self, Version version, const std::vector<Tag
 
 	block.pop_front(block.size());
 
-	for(auto& msg : taggedMessages) {
+	for (const auto& msg : taggedMessages) {
 		if(msg.message.size() > block.capacity() - block.size()) {
 			self->messageBlocks.emplace_back(version, block);
 			block = Standalone<VectorRef<uint8_t>>();
@@ -207,7 +207,7 @@ void commitMessages( LogRouterData* self, Version version, const std::vector<Tag
 		}
 
 		block.append(block.arena(), msg.message.begin(), msg.message.size());
-		for(auto& tag : msg.tags) {
+		for (const auto& tag : msg.tags) {
 			auto tagData = self->getTagData(tag);
 			if(!tagData) {
 				tagData = self->createTagData(tag, 0, 0);
@@ -269,7 +269,8 @@ ACTOR Future<Void> waitForVersion( LogRouterData *self, Version ver ) {
 	return Void();
 }
 
-// Log router pull data from satellite tLog
+// Log router (LR) asynchronously pull data from satellite tLogs (preferred) or primary tLogs at tag (self->routerTag)
+// for the version range from the LR's current version (exclusive) to its epoch's end version or recovery version.
 ACTOR Future<Void> pullAsyncData( LogRouterData *self ) {
 	state Future<Void> dbInfoChange = Void();
 	state Reference<ILogSystem::IPeekCursor> r;

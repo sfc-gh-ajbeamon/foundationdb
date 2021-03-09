@@ -93,14 +93,14 @@ public:
 
 	explicit SpecialKeyRangeRWImpl(KeyRangeRef kr) : SpecialKeyRangeReadImpl(kr) {}
 
-	virtual ~SpecialKeyRangeRWImpl() {}
+	~SpecialKeyRangeRWImpl() override {}
 };
 
 class SpecialKeyRangeAsyncImpl : public SpecialKeyRangeReadImpl {
 public:
 	explicit SpecialKeyRangeAsyncImpl(KeyRangeRef kr) : SpecialKeyRangeReadImpl(kr) {}
 
-	Future<Standalone<RangeResultRef>> getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const = 0;
+	Future<Standalone<RangeResultRef>> getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const override = 0;
 
 	// calling with a cache object to have consistent results if we need to call rpc
 	Future<Standalone<RangeResultRef>> getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr,
@@ -330,6 +330,21 @@ public:
 	Future<Optional<std::string>> commit(ReadYourWritesTransaction* ryw) override;
 	void clear(ReadYourWritesTransaction* ryw, const KeyRangeRef& range) override;
 	void clear(ReadYourWritesTransaction* ryw, const KeyRef& key) override;
+};
+
+class CoordinatorsImpl : public SpecialKeyRangeRWImpl {
+public:
+	explicit CoordinatorsImpl(KeyRangeRef kr);
+	Future<Standalone<RangeResultRef>> getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const override;
+	Future<Optional<std::string>> commit(ReadYourWritesTransaction* ryw) override;
+	void clear(ReadYourWritesTransaction* ryw, const KeyRangeRef& range) override;
+	void clear(ReadYourWritesTransaction* ryw, const KeyRef& key) override;
+};
+
+class CoordinatorsAutoImpl : public SpecialKeyRangeReadImpl {
+public:
+	explicit CoordinatorsAutoImpl(KeyRangeRef kr);
+	Future<Standalone<RangeResultRef>> getRange(ReadYourWritesTransaction* ryw, KeyRangeRef kr) const override;
 };
 
 #include "flow/unactorcompiler.h"

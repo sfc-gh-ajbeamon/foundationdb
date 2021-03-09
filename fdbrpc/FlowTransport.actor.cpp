@@ -181,9 +181,20 @@ struct EndpointNotFoundReceiver final : NetworkMessageReceiver {
 	}
 
 	void receive(ArenaObjectReader& reader) override {
+		// Remote machine tells us it doesn't have endpoint e
 		Endpoint e;
 		reader.deserialize(e);
 		IFailureMonitor::failureMonitor().endpointNotFound(e);
+	}
+};
+
+struct PingRequest {
+	constexpr static FileIdentifier file_identifier = 4707015;
+	ReplyPromise<Void> reply{ PeerCompatibilityPolicy{ RequirePeer::AtLeast,
+	                                                   ProtocolVersion::withStableInterfaces() } };
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, reply);
 	}
 };
 
@@ -192,11 +203,10 @@ struct PingReceiver final : NetworkMessageReceiver {
 		endpoints.insertWellKnown(this, WLTOKEN_PING_PACKET, TaskPriority::ReadSocket);
 	}
 	void receive(ArenaObjectReader& reader) override {
-		ReplyPromise<Void> reply;
-		reader.deserialize(reply);
-		reply.send(Void());
+		PingRequest req;
+		reader.deserialize(req);
+		req.reply.send(Void());
 	}
-
 	PeerCompatibilityPolicy peerCompatibilityPolicy() const override {
 		return { RequirePeer::AtLeast, ProtocolVersion::withStableInterfaces() };
 	}
@@ -443,8 +453,8 @@ ACTOR Future<Void> connectionMonitor( Reference<Peer> peer ) {
 		wait (delayJittered(FLOW_KNOBS->CONNECTION_MONITOR_LOOP_TIME, TaskPriority::ReadSocket));
 
 		// TODO: Stop monitoring and close the connection with no onDisconnect requests outstanding
-		state ReplyPromise<Void> reply;
-		FlowTransport::transport().sendUnreliable( SerializeSource<ReplyPromise<Void>>(reply), remotePingEndpoint, true );
+		state PingRequest pingRequest;
+		FlowTransport::transport().sendUnreliable( SerializeSource<PingRequest>(pingRequest), remotePingEndpoint, true );
 		state int64_t startingBytes = peer->bytesReceived;
 		state int timeouts = 0;
 		state double startTime = now();
@@ -467,7 +477,7 @@ ACTOR Future<Void> connectionMonitor( Reference<Peer> peer ) {
 					startingBytes = peer->bytesReceived;
 					timeouts++;
 				}
-				when (wait( reply.getFuture() )) {
+				when (wait( pingRequest.reply.getFuture() )) {
 					if(peer->destination.isPublic()) {
 						peer->pingLatencies.addSample(now() - startTime);
 					}
@@ -860,6 +870,9 @@ static bool checkCompatible(const PeerCompatibilityPolicy& policy, ProtocolVersi
 		return version.version() == policy.version.version();
 	case RequirePeer::AtLeast:
 		return version.version() >= policy.version.version();
+	default:
+		ASSERT(false);
+		return false;
 	}
 }
 
@@ -1166,12 +1179,14 @@ ACTOR static Future<Void> connectionReader(
 					}
 				}
 
-				if (compatible || peerProtocolVersion.hasStableInterfaces()) {
-					scanPackets( transport, unprocessed_begin, unprocessed_end, arena, peerAddress, peerProtocolVersion );
-				}
-				else if(!expectConnectPacket) {
-					unprocessed_begin = unprocessed_end;
-					peer->resetPing.trigger();
+				if(!expectConnectPacket) {
+					if (compatible || peerProtocolVersion.hasStableInterfaces()) {
+						scanPackets( transport, unprocessed_begin, unprocessed_end, arena, peerAddress, peerProtocolVersion );
+					}
+					else {
+						unprocessed_begin = unprocessed_end;
+						peer->resetPing.trigger();
+					}
 				}
 
 				if (readWillBlock)

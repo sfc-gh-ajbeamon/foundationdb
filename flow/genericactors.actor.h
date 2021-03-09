@@ -725,8 +725,8 @@ private:
 class Debouncer : NonCopyable {
 public:
 	explicit Debouncer( double delay ) { worker = debounceWorker(this, delay); }
-	Debouncer(Debouncer&& at) : input(std::move(at.input)), output(std::move(at.output)) {}
-	void operator=(Debouncer&& at) { input = std::move(at.input); output = std::move(at.output); }
+	Debouncer(Debouncer&& at) = default;
+	Debouncer& operator=(Debouncer&& at) = default;
 	Future<Void> onTrigger() {
 		return output.onChange();
 	}
@@ -866,6 +866,35 @@ Future<T> ioTimeoutError( Future<T> what, double time ) {
 }
 
 ACTOR template <class T>
+Future<T> ioDegradedOrTimeoutError(Future<T> what, double errTime, Reference<AsyncVar<bool>> degraded,
+                                   double degradedTime) {
+	if (degradedTime < errTime) {
+		Future<Void> degradedEnd = lowPriorityDelay(degradedTime);
+		choose {
+			when(T t = wait(what)) { return t; }
+			when(wait(degradedEnd)) {
+				TEST(true); // TLog degraded
+				TraceEvent(SevWarnAlways, "IoDegraded");
+				degraded->set(true);
+			}
+		}
+	}
+
+	Future<Void> end = lowPriorityDelay(errTime - degradedTime);
+	choose {
+		when(T t = wait(what)) { return t; }
+		when(wait(end)) {
+			Error err = io_timeout();
+			if (g_network->isSimulated()) {
+				err = err.asInjectedFault();
+			}
+			TraceEvent(SevError, "IoTimeoutError").error(err);
+			throw err;
+		}
+	}
+}
+
+ACTOR template <class T>
 Future<Void> streamHelper( PromiseStream<T> output, PromiseStream<Error> errors, Future<T> input ) {
 	try {
 		T value = wait(input);
@@ -899,12 +928,12 @@ struct Quorum : SAV<Void> {
 		return sizeof(Quorum<T>) + sizeof(QuorumCallback<T>)*count;
 	}
 
-	virtual void destroy() {
+	void destroy() override {
 		int size = sizeFor(this->count);
 		this->~Quorum();
 		freeFast(size, this);
 	}
-	virtual void cancel() {
+	void cancel() override {
 		int cancelled_callbacks = 0;
 		for (int i = 0; i < count; i++)
 			if (callbacks()[i].next) {
@@ -939,12 +968,12 @@ struct Quorum : SAV<Void> {
 template <class T>
 class QuorumCallback : public Callback<T> {
 public:
-	virtual void fire(const T& value) {
+	void fire(const T& value) override {
 		Callback<T>::remove();
 		Callback<T>::next = 0;
 		head->oneSuccess();
 	}
-	virtual void error(Error error) {
+	void error(Error error) override {
 		Callback<T>::remove();
 		Callback<T>::next = 0;
 		head->oneError(error);
@@ -1482,16 +1511,13 @@ struct YieldedFutureActor : SAV<Void>, ActorCallback<YieldedFutureActor, 1, Void
 		f.addYieldedCallbackAndClear(static_cast< ActorCallback< YieldedFutureActor, 1, Void >* >(this));
 	}
 
-	void cancel()
-	{
+	void cancel() override {
 		if (!SAV<Void>::canBeSet()) return;  // Cancel could be invoked *by* a callback within finish().  Otherwise it's guaranteed that we are waiting either on the original future or on a delay().
 		ActorCallback<YieldedFutureActor, 1, Void>::remove();
 		SAV<Void>::sendErrorAndDelPromiseRef(actor_cancelled());
 	}
 
-	virtual void destroy() {
-		delete this;
-	}
+	void destroy() override { delete this; }
 
 	void a_callback_fire(ActorCallback<YieldedFutureActor, 1, Void>*, Void) {
 		if (int16_t(in_error_state.code()) == UNSET_ERROR_CODE) {
@@ -1549,7 +1575,7 @@ inline Future<Void> yieldedFuture(Future<Void> f) {
 template <class K, class V>
 class YieldedAsyncMap : public AsyncMap<K, V> {
 public:
-	Future<Void> onChange(K const& k) {	// throws broken_promise if this is destroyed
+	Future<Void> onChange(K const& k) override { // throws broken_promise if this is destroyed
 		auto &item = AsyncMap<K, V>::items[k];
 		if (item.value == AsyncMap<K, V>::defaultValue)
 			return destroyOnCancelYield(this, k, item.change.getFuture());
@@ -1801,6 +1827,20 @@ Future<Void> timeReply(Future<T> replyToTime, PromiseStream<double> timeOutput){
 			throw;
 	}
 	return Void();
+}
+
+ACTOR template<class T>
+Future<T> forward(Future<T> from, Promise<T> to) {
+	try {
+		T res = wait(from);
+		to.send(res);
+		return res;
+	} catch (Error& e) {
+		if (e.code() != error_code_actor_cancelled) {
+			to.sendError(e);
+		}
+		throw e;
+	}
 }
 
 // Monad

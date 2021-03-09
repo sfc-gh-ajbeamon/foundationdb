@@ -871,13 +871,13 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<ClusterConnectionF
     transactionsCommitStarted("CommitStarted", cc), transactionsCommitCompleted("CommitCompleted", cc),
     transactionKeyServerLocationRequests("KeyServerLocationRequests", cc),
     transactionKeyServerLocationRequestsCompleted("KeyServerLocationRequestsCompleted", cc),
-    transactionsTooOld("TooOld", cc), transactionsFutureVersions("FutureVersions", cc),
-    transactionsNotCommitted("NotCommitted", cc), transactionsMaybeCommitted("MaybeCommitted", cc),
-    transactionsResourceConstrained("ResourceConstrained", cc), transactionsThrottled("Throttled", cc),
-    transactionsProcessBehind("ProcessBehind", cc), outstandingWatches(0), latencies(1000), readLatencies(1000),
-    commitLatencies(1000), GRVLatencies(1000), mutationsPerCommit(1000), bytesPerCommit(1000), mvCacheInsertLocation(0),
-    healthMetricsLastUpdated(0), detailedHealthMetricsLastUpdated(0), internal(internal), transactionTracingEnabled(true),
-    smoothMidShardSize(CLIENT_KNOBS->SHARD_STAT_SMOOTH_AMOUNT),
+    transactionStatusRequests("StatusRequests", cc), transactionsTooOld("TooOld", cc),
+    transactionsFutureVersions("FutureVersions", cc), transactionsNotCommitted("NotCommitted", cc),
+    transactionsMaybeCommitted("MaybeCommitted", cc), transactionsResourceConstrained("ResourceConstrained", cc),
+    transactionsThrottled("Throttled", cc), transactionsProcessBehind("ProcessBehind", cc), outstandingWatches(0),
+    latencies(1000), readLatencies(1000), commitLatencies(1000), GRVLatencies(1000), mutationsPerCommit(1000),
+    bytesPerCommit(1000), mvCacheInsertLocation(0), healthMetricsLastUpdated(0), detailedHealthMetricsLastUpdated(0),
+    internal(internal), transactionTracingEnabled(true), smoothMidShardSize(CLIENT_KNOBS->SHARD_STAT_SMOOTH_AMOUNT),
     transactionsExpensiveClearCostEstCount("ExpensiveClearCostEstCount", cc),
     specialKeySpace(std::make_unique<SpecialKeySpace>(specialKeys.begin, specialKeys.end, /* test */ false)) {
 	dbId = deterministicRandom()->randomUniqueID();
@@ -951,12 +951,18 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<ClusterConnectionF
 		            .withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::MANAGEMENT).begin)));
 		registerSpecialKeySpaceModule(
 		    SpecialKeySpace::MODULE::TRACING, SpecialKeySpace::IMPLTYPE::READWRITE,
-		    // std::make_unique<TracingOptionsImpl>(
-		    //     SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::TRACING)));
-		    // TODO: Temporary fix for an issue with special-key top level ranges.
 		    std::make_unique<TracingOptionsImpl>(
-		        KeyRangeRef(LiteralStringRef("a/"), LiteralStringRef("a0"))
-		            .withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::TRACING).begin)));
+		        SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::TRACING)));
+		registerSpecialKeySpaceModule(
+		    SpecialKeySpace::MODULE::CONFIGURATION, SpecialKeySpace::IMPLTYPE::READWRITE,
+		    std::make_unique<CoordinatorsImpl>(
+		        KeyRangeRef(LiteralStringRef("coordinators/"), LiteralStringRef("coordinators0"))
+		            .withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::CONFIGURATION).begin)));
+		registerSpecialKeySpaceModule(
+		    SpecialKeySpace::MODULE::MANAGEMENT, SpecialKeySpace::IMPLTYPE::READONLY,
+		    std::make_unique<CoordinatorsAutoImpl>(
+		        singleKeyRange(LiteralStringRef("auto_coordinators"))
+		            .withPrefix(SpecialKeySpace::getModuleRange(SpecialKeySpace::MODULE::MANAGEMENT).begin)));
 	}
 	if (apiVersionAtLeast(630)) {
 		registerSpecialKeySpaceModule(SpecialKeySpace::MODULE::TRANSACTION, SpecialKeySpace::IMPLTYPE::READONLY,
@@ -981,6 +987,7 @@ DatabaseContext::DatabaseContext(Reference<AsyncVar<Reference<ClusterConnectionF
 		                                           [](ReadYourWritesTransaction* ryw) -> Future<Optional<Value>> {
 			                                           if (ryw->getDatabase().getPtr() &&
 			                                               ryw->getDatabase()->getConnectionFile()) {
+				                                           ++ryw->getDatabase()->transactionStatusRequests;
 				                                           return getJSON(ryw->getDatabase());
 			                                           } else {
 				                                           return Optional<Value>();
@@ -1049,13 +1056,14 @@ DatabaseContext::DatabaseContext(const Error& err)
     transactionsCommitStarted("CommitStarted", cc), transactionsCommitCompleted("CommitCompleted", cc),
     transactionKeyServerLocationRequests("KeyServerLocationRequests", cc),
     transactionKeyServerLocationRequestsCompleted("KeyServerLocationRequestsCompleted", cc),
-    transactionsTooOld("TooOld", cc), transactionsFutureVersions("FutureVersions", cc),
-    transactionsNotCommitted("NotCommitted", cc), transactionsMaybeCommitted("MaybeCommitted", cc),
-    transactionsResourceConstrained("ResourceConstrained", cc), transactionsThrottled("Throttled", cc),
-    transactionsProcessBehind("ProcessBehind", cc), latencies(1000), readLatencies(1000), commitLatencies(1000),
-    GRVLatencies(1000), mutationsPerCommit(1000), bytesPerCommit(1000),
+    transactionStatusRequests("StatusRequests", cc), transactionsTooOld("TooOld", cc),
+    transactionsFutureVersions("FutureVersions", cc), transactionsNotCommitted("NotCommitted", cc),
+    transactionsMaybeCommitted("MaybeCommitted", cc), transactionsResourceConstrained("ResourceConstrained", cc),
+    transactionsThrottled("Throttled", cc), transactionsProcessBehind("ProcessBehind", cc), latencies(1000),
+    readLatencies(1000), commitLatencies(1000), GRVLatencies(1000), mutationsPerCommit(1000), bytesPerCommit(1000),
     smoothMidShardSize(CLIENT_KNOBS->SHARD_STAT_SMOOTH_AMOUNT),
-    transactionsExpensiveClearCostEstCount("ExpensiveClearCostEstCount", cc), internal(false), transactionTracingEnabled(true) {}
+    transactionsExpensiveClearCostEstCount("ExpensiveClearCostEstCount", cc), internal(false),
+    transactionTracingEnabled(true) {}
 
 Database DatabaseContext::create(Reference<AsyncVar<ClientDBInfo>> clientInfo, Future<Void> clientInfoMonitor, LocalityData clientLocality, bool enableLocalityLoadBalance, TaskPriority taskID, bool lockAware, int apiVersion, bool switchable) {
 	return Database( new DatabaseContext( Reference<AsyncVar<Reference<ClusterConnectionFile>>>(), clientInfo, clientInfoMonitor, taskID, clientLocality, enableLocalityLoadBalance, lockAware, true, apiVersion, switchable ) );
@@ -1111,7 +1119,7 @@ bool DatabaseContext::getCachedLocations( const KeyRangeRef& range, vector<std::
 Reference<LocationInfo> DatabaseContext::setCachedLocation( const KeyRangeRef& keys, const vector<StorageServerInterface>& servers ) {
 	vector<Reference<ReferencedInterface<StorageServerInterface>>> serverRefs;
 	serverRefs.reserve(servers.size());
-	for(auto& interf : servers) {
+	for (const auto& interf : servers) {
 		serverRefs.push_back( StorageServerInfo::getInterface( this, interf, clientLocality ) );
 	}
 
@@ -1218,11 +1226,11 @@ void DatabaseContext::setOption( FDBDatabaseOptions::Option option, Optional<Str
 				validateOptionValue(value, false);
 				snapshotRywEnabled--;
 				break;
-			case FDBDatabaseOptions::TRANSACTION_TRACE_ENABLE:
+			case FDBDatabaseOptions::DISTRIBUTED_TRANSACTION_TRACE_ENABLE:
 				validateOptionValue(value, false);
 				transactionTracingEnabled++;
 				break;
-			case FDBDatabaseOptions::TRANSACTION_TRACE_DISABLE:
+			case FDBDatabaseOptions::DISTRIBUTED_TRANSACTION_TRACE_DISABLE:
 				validateOptionValue(value, false);
 				transactionTracingEnabled--;
 				break;
@@ -1377,6 +1385,32 @@ Database Database::createDatabase( std::string connFileName, int apiVersion, boo
 	return Database::createDatabase(rccf, apiVersion, internal, clientLocality);
 }
 
+Reference<WatchMetadata> DatabaseContext::getWatchMetadata(KeyRef key) const {
+	const auto it = watchMap.find(key);
+	if (it == watchMap.end()) return Reference<WatchMetadata>();
+	return it->second;
+}
+
+KeyRef DatabaseContext::setWatchMetadata(Reference<WatchMetadata> metadata) {
+	KeyRef keyRef = metadata->key.contents();
+	watchMap[keyRef] = metadata;
+	return keyRef;
+}
+
+void DatabaseContext::deleteWatchMetadata(KeyRef key) {
+	watchMap.erase(key);
+}
+
+void DatabaseContext::clearWatchMetadata() {
+	watchMap.clear();
+}
+
+WatchMetadata::WatchMetadata(Key key, Optional<Value> value, Version version, TransactionInfo info, TagSet tags)
+  : key(key), value(value), version(version), info(info), tags(tags) {
+	// create dummy future
+	watchFuture = watchPromise.getFuture();
+}
+
 const UniqueOrderedOptionList<FDBTransactionOptions>& Database::getTransactionDefaults() const {
 	ASSERT(db);
 	return db->transactionDefaults;
@@ -1449,22 +1483,17 @@ void setNetworkOption(FDBNetworkOptions::Option option, Optional<StringRef> valu
 
 			std::string knobName = optionValue.substr(0, eq);
 			std::string knobValue = optionValue.substr(eq+1);
-			if (const_cast<FlowKnobs*>(FLOW_KNOBS)->setKnob(knobName, knobValue))
-			{
-				// update dependent knobs
-				const_cast<FlowKnobs*>(FLOW_KNOBS)->initialize();
-			}
-			else if (const_cast<ClientKnobs*>(CLIENT_KNOBS)->setKnob(knobName, knobValue))
-			{
-				// update dependent knobs
-				const_cast<ClientKnobs*>(CLIENT_KNOBS)->initialize();
-			}
-			else
-			{
-				TraceEvent(SevWarnAlways, "UnrecognizedKnob").detail("Knob", knobName.c_str());
+		    if (globalFlowKnobs->setKnob(knobName, knobValue)) {
+			    // update dependent knobs
+			    globalFlowKnobs->initialize();
+		    } else if (globalClientKnobs->setKnob(knobName, knobValue)) {
+			    // update dependent knobs
+			    globalClientKnobs->initialize();
+		    } else {
+			    TraceEvent(SevWarnAlways, "UnrecognizedKnob").detail("Knob", knobName.c_str());
 				fprintf(stderr, "FoundationDB client ignoring unrecognized knob option '%s'\n", knobName.c_str());
-			}
-			break;
+		    }
+		    break;
 		}
 		case FDBNetworkOptions::TLS_PLUGIN:
 			validateOptionValue(value, true);
@@ -1546,6 +1575,21 @@ void setNetworkOption(FDBNetworkOptions::Option option, Optional<StringRef> valu
 			validateOptionValue(value, false);
 			networkOptions.runLoopProfilingEnabled = true;
 			break;
+		case FDBNetworkOptions::DISTRIBUTED_CLIENT_TRACER: {
+			validateOptionValue(value, true);
+			std::string tracer = value.get().toString();
+			if (tracer == "none" || tracer == "disabled") {
+				openTracer(TracerType::DISABLED);
+			} else if (tracer == "logfile" || tracer == "file" || tracer == "log_file") {
+				openTracer(TracerType::LOG_FILE);
+			} else if (tracer == "network_lossy") {
+				openTracer(TracerType::NETWORK_LOSSY);
+			} else {
+				fprintf(stderr, "ERROR: Unknown or unsupported tracer: `%s'", tracer.c_str());
+				throw invalid_option_value();
+			}
+			break;
+		}
 		default:
 			break;
 	}
@@ -1734,7 +1778,8 @@ ACTOR Future<Optional<StorageServerInterface>> fetchServerInterface( Database cx
 
 ACTOR Future<Optional<vector<StorageServerInterface>>> transactionalGetServerInterfaces( Future<Version> ver, Database cx, TransactionInfo info, vector<UID> ids, TagSet tags ) {
 	state vector< Future< Optional<StorageServerInterface> > > serverListEntries;
-	for( int s = 0; s < ids.size(); s++ ) {
+	serverListEntries.reserve(ids.size());
+	for (int s = 0; s < ids.size(); s++) {
 		serverListEntries.push_back( fetchServerInterface( cx, info, ids[s], tags, ver ) );
 	}
 
@@ -1857,17 +1902,17 @@ Future< vector< pair<KeyRange,Reference<LocationInfo>> > > getKeyRangeLocations(
 	}
 
 	bool foundFailed = false;
-	for(auto& it : locations) {
+	for (const auto& [range, locInfo] : locations) {
 		bool onlyEndpointFailed = false;
-		for(int i = 0; i < it.second->size(); i++) {
-			if( IFailureMonitor::failureMonitor().onlyEndpointFailed(it.second->get(i, member).getEndpoint()) ) {
+		for (int i = 0; i < locInfo->size(); i++) {
+			if (IFailureMonitor::failureMonitor().onlyEndpointFailed(locInfo->get(i, member).getEndpoint())) {
 				onlyEndpointFailed = true;
 				break;
 			}
 		}
 
 		if( onlyEndpointFailed ) {
-			cx->invalidateCache( it.first.begin );
+			cx->invalidateCache(range.begin);
 			foundFailed = true;
 		}
 	}
@@ -1918,6 +1963,7 @@ ACTOR Future<Optional<Value>> getValue( Future<Version> version, Key key, Databa
 {
 	state Version ver = wait( version );
 	state Span span("NAPI:getValue"_loc, info.spanID);
+	span.addTag("key"_sr, key);
 	cx->validateVersion(ver);
 
 	loop {
@@ -2121,8 +2167,8 @@ ACTOR Future<Void> readVersionBatcher(
 	DatabaseContext* cx, FutureStream<std::pair<Promise<GetReadVersionReply>, Optional<UID>>> versionStream,
 	uint32_t flags);
 
-ACTOR Future<Void> watchValue(Future<Version> version, Key key, Optional<Value> value, Database cx,
-                              TransactionInfo info, TagSet tags) {
+ACTOR Future<Version> watchValue(Future<Version> version, Key key, Optional<Value> value, Database cx,
+                                 TransactionInfo info, TagSet tags) {
 	state Version ver = wait( version );
 	state Span span("NAPI:watchValue"_loc, info.spanID);
 	cx->validateVersion(ver);
@@ -2162,7 +2208,9 @@ ACTOR Future<Void> watchValue(Future<Version> version, Key key, Optional<Value> 
 
 			// False if there is a master failure between getting the response and getting the committed version,
 			// Dependent on SERVER_KNOBS->MAX_VERSIONS_IN_FLIGHT
-			if (v - resp.version < 50000000) return Void();
+			if (v - resp.version < 50000000) {
+				return resp.version;
+			}
 			ver = v;
 		} catch (Error& e) {
 			if (e.code() == error_code_wrong_shard_server || e.code() == error_code_all_alternatives_failed) {
@@ -2182,6 +2230,131 @@ ACTOR Future<Void> watchValue(Future<Version> version, Key key, Optional<Value> 
 			}
 		}
 	}
+}
+
+ACTOR Future<Void> watchStorageServerResp(KeyRef key, Database cx) {
+	loop {
+		try {
+			state Reference<WatchMetadata> metadata = cx->getWatchMetadata(key);
+			if (!metadata.isValid()) return Void();
+
+			Version watchVersion = wait(watchValue(Future<Version>(metadata->version), metadata->key, metadata->value,
+			                                       cx, metadata->info, metadata->tags));
+
+			metadata = cx->getWatchMetadata(key);
+			if (!metadata.isValid()) return Void();
+			
+			if (watchVersion >= metadata->version) { // case 1: version_1 (SS) >= version_2 (map)
+				cx->deleteWatchMetadata(key);
+				if(metadata->watchPromise.canBeSet()) metadata->watchPromise.send(watchVersion);
+			} else { //ABA happens
+				TEST(true); // ABA issue where the version returned from the server is less than the version in the map
+				if (metadata->watchPromise.getFutureReferenceCount() == 1) { // case 2: version_1 < version_2 and future_count == 1
+					cx->deleteWatchMetadata(key);
+				}
+			}
+		} catch (Error& e) {
+			if (e.code() == error_code_operation_cancelled) {
+				throw e;
+			}
+
+			Reference<WatchMetadata> metadata = cx->getWatchMetadata(key);
+			if (!metadata.isValid()) {
+				return Void();
+			} else if (metadata->watchPromise.getFutureReferenceCount() == 1) {
+				cx->deleteWatchMetadata(key);
+				return Void();
+			} else if (e.code() == error_code_future_version) {
+				continue;
+			}
+			cx->deleteWatchMetadata(key);
+			metadata->watchPromise.sendError(e);
+			throw e;
+		}
+	}
+}
+
+ACTOR Future<Void> sameVersionDiffValue(Version ver, Key key, Optional<Value> value, Database cx,
+                              TransactionInfo info, TagSet tags) {
+	state ReadYourWritesTransaction tr(cx);
+	loop {
+		try {
+			tr.setOption(FDBTransactionOptions::READ_SYSTEM_KEYS);
+			state Optional<Value> valSS = wait(tr.get(key));
+			Reference<WatchMetadata> metadata = cx->getWatchMetadata(key.contents());
+
+			if (metadata.isValid() &&
+			    valSS != metadata->value) { // val_3 != val_1 (storage server value doesnt match value in map)
+				cx->deleteWatchMetadata(key.contents());
+
+				metadata->watchPromise.send(ver);
+				metadata->watchFutureSS.cancel();
+			}
+
+			if (valSS == value) { // val_3 == val_2 (storage server value matches value passed into the function -> new watch)
+				metadata = makeReference<WatchMetadata>(key, value, ver, info, tags);
+				KeyRef keyRef = cx->setWatchMetadata(metadata);
+
+				metadata->watchFutureSS = watchStorageServerResp(keyRef, cx);
+			}
+
+			if (valSS != value) return Void(); // if val_3 != val_2
+
+			wait(success(metadata->watchPromise.getFuture())); // val_3 == val_2
+
+			return Void();
+		} catch (Error& e) {
+			wait(tr.onError(e));
+		}
+	}
+}
+
+Future<Void> getWatchFuture(Version ver, Key key, Optional<Value> value, Database cx,
+                              TransactionInfo info, TagSet tags) {
+	Reference<WatchMetadata> metadata = cx->getWatchMetadata(key.contents());
+
+	if (!metadata.isValid()) { // case 1: key not in map
+		metadata = makeReference<WatchMetadata>(key, value, ver, info, tags);
+		KeyRef keyRef = cx->setWatchMetadata(metadata);
+
+		metadata->watchFutureSS = watchStorageServerResp(keyRef, cx);
+		return success(metadata->watchPromise.getFuture());
+	} 
+	else if (metadata->value == value) { // case 2: val_1 == val_2 (received watch with same value as key already in the map so just update)
+		if (ver > metadata->version) {
+			metadata->version = ver;
+			metadata->info = info;
+			metadata->tags = tags;
+		}
+		
+		return success(metadata->watchPromise.getFuture());
+	} else if(ver > metadata->version) { // case 3: val_1 != val_2 && version_2 > version_1 (recived watch with different value and a higher version so recreate in SS)
+		TEST(true); // Setting a watch that has a different value than the one in the map but a higher version (newer)
+		cx->deleteWatchMetadata(key.contents());
+
+		metadata->watchPromise.send(ver);
+		metadata->watchFutureSS.cancel();
+
+		metadata = makeReference<WatchMetadata>(key, value, ver, info, tags);
+		KeyRef keyRef = cx->setWatchMetadata(metadata);
+
+		metadata->watchFutureSS = watchStorageServerResp(keyRef, cx);
+
+		return success(metadata->watchPromise.getFuture());
+	} else if (metadata->version == ver) { // case 5: val_1 != val_2 && version_1 == version_2 (recived watch with different value but same version)
+		TEST(true); // Setting a watch which has a different value than the one in the map but the same version
+		return sameVersionDiffValue(ver, key, value, cx, info, tags);
+	}
+	TEST(true); // Setting a watch which has a different value than the one in the map but a lower version (older)
+	// case 4: val_1 != val_2 && version_2 < version_1
+	return Void();
+}
+
+ACTOR Future<Void> watchValueMap(Future<Version> version, Key key, Optional<Value> value, Database cx,
+                              TransactionInfo info, TagSet tags) {
+	state Version ver = wait(version);
+	wait(getWatchFuture(ver, key, value, cx, info, tags));
+	return Void();
 }
 
 void transformRangeLimits(GetRangeLimits limits, bool reverse, GetKeyValuesRequest &req) {
@@ -2542,7 +2715,6 @@ ACTOR Future<Standalone<RangeResultRef>> getRange( Database cx, Reference<Transa
 				}
 
 				++cx->transactionPhysicalReads;
-				++cx->transactionGetRangeRequests;
 				state GetKeyValuesReply rep;
 				try {
 					if (CLIENT_BUGGIFY) {
@@ -2855,8 +3027,9 @@ ACTOR Future<Void> watch(Reference<Watch> watch, Database cx, TagSet tags, Trans
 
 						when(wait(cx->connectionFileChanged())) {
 							TEST(true); // Recreated a watch after switch
+							cx->clearWatchMetadata();
 							watch->watchFuture =
-							    watchValue(cx->minAcceptableReadVersion, watch->key, watch->value, cx, info, tags);
+							    watchValueMap(cx->minAcceptableReadVersion, watch->key, watch->value, cx, info, tags);
 						}
 					}
 				}
@@ -3390,7 +3563,7 @@ void Transaction::setupWatches() {
 		Future<Version> watchVersion = getCommittedVersion() > 0 ? getCommittedVersion() : getReadVersion();
 
 		for(int i = 0; i < watches.size(); ++i)
-			watches[i]->setWatch(watchValue(watchVersion, watches[i]->key, watches[i]->value, cx, info, options.readTags));
+			watches[i]->setWatch(watchValueMap(watchVersion, watches[i]->key, watches[i]->value, cx, info, options.readTags));
 
 		watches.clear();
 	}
@@ -4429,7 +4602,7 @@ namespace {
 	}
 }
 
-ACTOR Future<uint64_t> getCoordinatorProtocols(Reference<ClusterConnectionFile> f,  Optional<ProtocolVersion> expectedProtocol) {
+ACTOR Future<uint64_t> getCoordinatorProtocols(Reference<ClusterConnectionFile> f, Optional<ProtocolVersion> expectedProtocol) {
 	loop {
 		state ProtocolVersion coordProtocol;
 		choose {
@@ -4961,6 +5134,7 @@ ACTOR Future<bool> checkSafeExclusions(Database cx, vector<AddressExclusion> exc
 	TraceEvent("ExclusionSafetyCheckCoordinators");
 	state ClientCoordinators coordinatorList(cx->getConnectionFile());
 	state vector<Future<Optional<LeaderInfo>>> leaderServers;
+	leaderServers.reserve(coordinatorList.clientLeaderServers.size());
 	for (int i = 0; i < coordinatorList.clientLeaderServers.size(); i++) {
 		leaderServers.push_back(retryBrokenPromise(coordinatorList.clientLeaderServers[i].getLeader,
 		                                           GetLeaderRequest(coordinatorList.clusterKey, UID()),
@@ -5000,4 +5174,74 @@ ACTOR Future<bool> checkSafeExclusions(Database cx, vector<AddressExclusion> exc
 	    .detail("DataDistributorCheck", ddCheck);
 
 	return (ddCheck && coordinatorCheck);
+}
+
+ACTOR Future<Void> addInterfaceActor( std::map<Key,std::pair<Value,ClientLeaderRegInterface>>* address_interface, Reference<FlowLock> connectLock, KeyValue kv) {
+	wait(connectLock->take());
+	state FlowLock::Releaser releaser(*connectLock);
+	state ClientWorkerInterface workerInterf = BinaryReader::fromStringRef<ClientWorkerInterface>(kv.value, IncludeVersion());
+	state ClientLeaderRegInterface leaderInterf(workerInterf.address());
+	choose {
+		when( Optional<LeaderInfo> rep = wait( brokenPromiseToNever(leaderInterf.getLeader.getReply(GetLeaderRequest())) ) ) {
+			StringRef ip_port =
+				kv.key.endsWith(LiteralStringRef(":tls")) ? kv.key.removeSuffix(LiteralStringRef(":tls")) : kv.key;
+			(*address_interface)[ip_port] = std::make_pair(kv.value, leaderInterf);
+
+			if(workerInterf.reboot.getEndpoint().addresses.secondaryAddress.present()) {
+				Key full_ip_port2 =
+				    StringRef(workerInterf.reboot.getEndpoint().addresses.secondaryAddress.get().toString());
+				StringRef ip_port2 = full_ip_port2.endsWith(LiteralStringRef(":tls")) ? full_ip_port2.removeSuffix(LiteralStringRef(":tls")) : full_ip_port2;
+				(*address_interface)[ip_port2] = std::make_pair(kv.value, leaderInterf);
+			}
+		}
+		when( wait(delay(CLIENT_KNOBS->CLI_CONNECT_TIMEOUT)) ) {} // NOTE : change timeout time here if necessary
+	}
+	return Void();
+}
+
+ACTOR static Future<int64_t> rebootWorkerActor(DatabaseContext* cx, ValueRef addr, bool check, int duration) {
+	// ignore negative value
+	if (duration < 0) duration = 0;
+	// fetch the addresses of all workers
+	state std::map<Key,std::pair<Value,ClientLeaderRegInterface>> address_interface;
+	if (!cx->getConnectionFile())
+		return 0;
+	Standalone<RangeResultRef> kvs = wait(getWorkerInterfaces(cx->getConnectionFile()));
+	ASSERT(!kvs.more);
+	// Note: reuse this knob from fdbcli, change it if necessary
+	Reference<FlowLock> connectLock(new FlowLock(CLIENT_KNOBS->CLI_CONNECT_PARALLELISM));
+	std::vector<Future<Void>> addInterfs;
+	for( const auto& it : kvs ) {
+		addInterfs.push_back(addInterfaceActor(&address_interface, connectLock, it));
+	}
+	wait(waitForAll(addInterfs));
+	if (!address_interface.count(addr)) return 0;
+
+	BinaryReader::fromStringRef<ClientWorkerInterface>(address_interface[addr].first, IncludeVersion())
+	    .reboot.send(RebootRequest(false, check, duration));
+	return 1;
+}
+
+Future<int64_t> DatabaseContext::rebootWorker(StringRef addr, bool check, int duration) {
+	return rebootWorkerActor(this, addr, check, duration);
+}
+
+Future<Void> DatabaseContext::forceRecoveryWithDataLoss(StringRef dcId) {
+	return forceRecovery(getConnectionFile(), dcId);
+}
+
+ACTOR static Future<Void> createSnapshotActor(DatabaseContext* cx, UID snapUID, StringRef snapCmd) {
+	wait(mgmtSnapCreate(cx->clone(), snapCmd, snapUID));
+	return Void();
+}
+
+Future<Void> DatabaseContext::createSnapshot(StringRef uid,
+                                             StringRef snapshot_command) {
+	std::string uid_str = uid.toString();
+	if (!std::all_of(uid_str.begin(), uid_str.end(), [](unsigned char c) { return std::isxdigit(c); }) ||
+	    uid_str.size() != 32) {
+		// only 32-length hex string is considered as a valid UID
+		throw snap_invalid_uid_string();
+	}
+	return createSnapshotActor(this, UID::fromString(uid_str), snapshot_command);
 }

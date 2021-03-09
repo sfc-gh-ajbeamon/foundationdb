@@ -25,6 +25,7 @@
 #include <math.h> // For _set_FMA3_enable workaround in platformInit
 #endif
 
+#include <errno.h>
 #include "flow/Platform.h"
 #include "flow/Platform.actor.h"
 #include "flow/Arena.h"
@@ -48,7 +49,6 @@
 #include "flow/FaultInjection.h"
 
 #ifdef _WIN32
-#define NOMINMAX
 #include <windows.h>
 #include <winioctl.h>
 #include <io.h>
@@ -2371,7 +2371,7 @@ ACTOR Future<vector<std::string>> findFiles( std::string directory, std::string 
                                              bool directoryOnly, bool async) {
 	INJECT_FAULT( platform_error, "findFiles" ); // findFiles failed (Win32)
 	state vector<std::string> result;
-	state int64_t tsc_begin = __rdtsc();
+	state int64_t tsc_begin = timestampCounter();
 
 
 	state WIN32_FIND_DATA fd;
@@ -2390,9 +2390,9 @@ ACTOR Future<vector<std::string>> findFiles( std::string directory, std::string 
 			}
 			if (!FindNextFile( h, &fd ))
 				break;
-			if (async && __rdtsc() - tsc_begin > FLOW_KNOBS->TSC_YIELD_TIME && !g_network->isSimulated()) {
+			if (async && timestampCounter() - tsc_begin > FLOW_KNOBS->TSC_YIELD_TIME && !g_network->isSimulated()) {
 				wait( yield() );
-				tsc_begin = __rdtsc();
+				tsc_begin = timestampCounter();
 			}
 		}
 		if (GetLastError() != ERROR_NO_MORE_FILES) {
@@ -2406,7 +2406,7 @@ ACTOR Future<vector<std::string>> findFiles( std::string directory, std::string 
 	return result;
 }
 
-#elif (defined(__linux__) || defined(__APPLE__))
+#elif (defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__))
 #define FILE_ATTRIBUTE_DATA mode_t
 
 bool acceptFile( FILE_ATTRIBUTE_DATA fileAttributes, std::string const& name, std::string const& extension ) {
@@ -2421,7 +2421,7 @@ ACTOR Future<vector<std::string>> findFiles( std::string directory, std::string 
                                              bool directoryOnly, bool async) {
 	INJECT_FAULT( platform_error, "findFiles" ); // findFiles failed
 	state vector<std::string> result;
-	state int64_t tsc_begin = __rdtsc();
+	state int64_t tsc_begin = timestampCounter();
 
 	state DIR *dip = nullptr;
 
@@ -2451,9 +2451,9 @@ ACTOR Future<vector<std::string>> findFiles( std::string directory, std::string 
 			    (!directoryOnly && acceptFile(buf.st_mode, name, extension))) {
 				result.push_back( name );
 			}
-			if (async && __rdtsc() - tsc_begin > FLOW_KNOBS->TSC_YIELD_TIME && !g_network->isSimulated()) {
+			if (async && timestampCounter() - tsc_begin > FLOW_KNOBS->TSC_YIELD_TIME && !g_network->isSimulated()) {
 				wait( yield() );
-				tsc_begin = __rdtsc();
+				tsc_begin = timestampCounter();
 			}
 		}
 
@@ -2656,7 +2656,13 @@ int64_t fileSize(std::string const& filename) {
 std::string readFileBytes( std::string const& filename, int maxSize ) {
 	std::string s;
 	FILE* f = fopen(filename.c_str(), "rb" FOPEN_CLOEXEC_MODE);
-	if (!f) throw file_not_readable();
+	if (!f) {
+		TraceEvent(SevWarn, "FileOpenError")
+			.detail("Filename", filename)
+			.detail("Errno", errno)
+			.detail("ErrorDescription", strerror(errno));
+		throw file_not_readable();
+	}
 	try {
 		fseek(f, 0, SEEK_END);
 		size_t size = ftell(f);

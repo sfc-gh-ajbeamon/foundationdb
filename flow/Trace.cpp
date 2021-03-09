@@ -729,7 +729,7 @@ TraceEvent::TraceEvent(TraceEvent &&ev) {
 	maxEventLength = ev.maxEventLength;
 	maxFieldLength = ev.maxFieldLength;
 	severity = ev.severity;
-	tmpEventMetric = ev.tmpEventMetric;
+	tmpEventMetric = std::move(ev.tmpEventMetric);
 	trackingKey = ev.trackingKey;
 	type = ev.type;
 	timeIndex = ev.timeIndex;
@@ -743,7 +743,6 @@ TraceEvent::TraceEvent(TraceEvent &&ev) {
 	ev.initialized = true;
 	ev.enabled = false;
 	ev.logged = true;
-	ev.tmpEventMetric = nullptr;
 }
 
 TraceEvent& TraceEvent::operator=(TraceEvent &&ev) {
@@ -757,7 +756,7 @@ TraceEvent& TraceEvent::operator=(TraceEvent &&ev) {
 	maxEventLength = ev.maxEventLength;
 	maxFieldLength = ev.maxFieldLength;
 	severity = ev.severity;
-	tmpEventMetric = ev.tmpEventMetric;
+	tmpEventMetric = std::move(ev.tmpEventMetric);
 	trackingKey = ev.trackingKey;
 	type = ev.type;
 	timeIndex = ev.timeIndex;
@@ -771,7 +770,6 @@ TraceEvent& TraceEvent::operator=(TraceEvent &&ev) {
 	ev.initialized = true;
 	ev.enabled = false;
 	ev.logged = true;
-	ev.tmpEventMetric = nullptr;
 
 	return *this;
 }
@@ -852,7 +850,7 @@ bool TraceEvent::init() {
 	}
 
 	if(enabled) {
-		tmpEventMetric = new DynamicEventMetric(MetricNameRef());
+		tmpEventMetric = std::make_unique<DynamicEventMetric>(MetricNameRef());
 
 		if(err.isValid() && err.isInjectedFault() && severity == SevError) {
 			severity = SevWarnAlways;
@@ -861,7 +859,7 @@ bool TraceEvent::init() {
 		detail("Severity", int(severity));
 		detail("Time", "0.000000");
 		timeIndex = fields.size() - 1;
-		if (FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
+		if (FLOW_KNOBS && FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
 			detail("DateTime", "");
 		}
 
@@ -1042,6 +1040,10 @@ TraceEvent& TraceEvent::setMaxFieldLength(int maxFieldLength) {
 	return *this;
 }
 
+int TraceEvent::getMaxFieldLength() const {
+	return maxFieldLength;
+}
+
 TraceEvent& TraceEvent::setMaxEventLength(int maxEventLength) {
 	ASSERT(!logged);
 	if(maxEventLength == 0) {
@@ -1052,6 +1054,10 @@ TraceEvent& TraceEvent::setMaxEventLength(int maxEventLength) {
 	}
 
 	return *this;
+}
+
+int TraceEvent::getMaxEventLength() const {
+	return maxEventLength;
 }
 
 TraceEvent& TraceEvent::GetLastError() {
@@ -1083,7 +1089,7 @@ void TraceEvent::log() {
 			if (enabled) {
 				double time = TraceEvent::getCurrentTime();
 				fields.mutate(timeIndex).second = format("%.6f", time);
-				if (FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
+				if (FLOW_KNOBS && FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
 					fields.mutate(timeIndex + 1).second = TraceEvent::printRealTime(time);
 				}
 
@@ -1107,7 +1113,7 @@ void TraceEvent::log() {
 						// If the event IS logged, a timestamp will be returned, if not then 0.  Either way, pass it through to be used if possible
 						// in the Sev* event metrics.
 
-						uint64_t event_ts = DynamicEventMetric::getOrCreateInstance(format("TraceEvent.%s", type), StringRef(), true)->setFieldsAndLogFrom(tmpEventMetric);
+						uint64_t event_ts = DynamicEventMetric::getOrCreateInstance(format("TraceEvent.%s", type), StringRef(), true)->setFieldsAndLogFrom(tmpEventMetric.get());
 						g_traceLog.log(severity, type, id, event_ts);
 					}
 				}
@@ -1115,7 +1121,7 @@ void TraceEvent::log() {
 		} catch( Error &e ) {
 			TraceEvent(SevError, "TraceEventLoggingError").error(e,true);
 		}
-		delete tmpEventMetric;
+		tmpEventMetric.reset();
 		logged = true;
 		--g_allocation_tracing_disabled;
 	}
@@ -1267,7 +1273,7 @@ void TraceBatch::dump() {
 TraceBatch::EventInfo::EventInfo(double time, const char *name, uint64_t id, const char *location) {
 	fields.addField("Severity", format("%d", (int)TRACE_BATCH_IMPLICIT_SEVERITY));
 	fields.addField("Time", format("%.6f", time));
-	if (FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
+	if (FLOW_KNOBS && FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
 		fields.addField("DateTime", TraceEvent::printRealTime(time));
 	}
 	fields.addField("Type", name);
@@ -1278,7 +1284,7 @@ TraceBatch::EventInfo::EventInfo(double time, const char *name, uint64_t id, con
 TraceBatch::AttachInfo::AttachInfo(double time, const char *name, uint64_t id, uint64_t to) {
 	fields.addField("Severity", format("%d", (int)TRACE_BATCH_IMPLICIT_SEVERITY));
 	fields.addField("Time", format("%.6f", time));
-	if (FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
+	if (FLOW_KNOBS && FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
 		fields.addField("DateTime", TraceEvent::printRealTime(time));
 	}
 	fields.addField("Type", name);
@@ -1289,7 +1295,7 @@ TraceBatch::AttachInfo::AttachInfo(double time, const char *name, uint64_t id, u
 TraceBatch::BuggifyInfo::BuggifyInfo(double time, int activated, int line, std::string file) {
 	fields.addField("Severity", format("%d", (int)TRACE_BATCH_IMPLICIT_SEVERITY));
 	fields.addField("Time", format("%.6f", time));
-	if (FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
+	if (FLOW_KNOBS && FLOW_KNOBS->TRACE_DATETIME_ENABLED) {
 		fields.addField("DateTime", TraceEvent::printRealTime(time));
 	}
 	fields.addField("Type", "BuggifySection");

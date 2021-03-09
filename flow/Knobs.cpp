@@ -23,7 +23,8 @@
 #include <cmath>
 #include <cinttypes>
 
-FlowKnobs const* FLOW_KNOBS = new FlowKnobs();
+std::unique_ptr<FlowKnobs> globalFlowKnobs = std::make_unique<FlowKnobs>();
+FlowKnobs const* FLOW_KNOBS = globalFlowKnobs.get();
 
 #define init( knob, value ) initKnob( knob, value, #knob )
 
@@ -62,6 +63,7 @@ void FlowKnobs::initialize(bool randomize, bool isSimulated) {
 	init( HUGE_ARENA_LOGGING_INTERVAL,                         5.0 );
 
 	init( WRITE_TRACING_ENABLED,                              true ); if( randomize && BUGGIFY ) WRITE_TRACING_ENABLED = false;
+	init( TRACING_UDP_LISTENER_PORT,                          8889 ); // Only applicable if TracerType is set to a network option.
 
 	//connectionMonitor
 	init( CONNECTION_MONITOR_LOOP_TIME,   isSimulated ? 0.75 : 1.0 ); if( randomize && BUGGIFY ) CONNECTION_MONITOR_LOOP_TIME = 6.0;
@@ -115,6 +117,11 @@ void FlowKnobs::initialize(bool randomize, bool isSimulated) {
 	init( MAX_EVICT_ATTEMPTS,                                  100 ); if( randomize && BUGGIFY ) MAX_EVICT_ATTEMPTS = 2;
 	init( CACHE_EVICTION_POLICY,                          "random" );
 	init( PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION,                 0.1 ); if( randomize && BUGGIFY ) PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION = 0.0; else if( randomize && BUGGIFY ) PAGE_CACHE_TRUNCATE_LOOKUP_FRACTION = 1.0;
+	init( FLOW_CACHEDFILE_WRITE_IO_SIZE,                         0 );
+	if ( randomize && BUGGIFY) {
+		// Choose 16KB to 64KB as I/O size
+		FLOW_CACHEDFILE_WRITE_IO_SIZE = deterministicRandom()->randomInt(16384, 65537);
+	}
 
 	//AsyncFileEIO
 	init( EIO_MAX_PARALLELISM,                                  4  );
@@ -133,6 +140,7 @@ void FlowKnobs::initialize(bool randomize, bool isSimulated) {
 	//GenericActors
 	init( BUGGIFY_FLOW_LOCK_RELEASE_DELAY,                     1.0 );
 	init( LOW_PRIORITY_DELAY_COUNT,                              5 );
+	init( LOW_PRIORITY_MAX_DELAY,                              5.0 );
 
 	//IAsyncFile
 	init( INCREMENTAL_DELETE_TRUNCATE_AMOUNT,                  5e8 ); //500MB
@@ -146,6 +154,7 @@ void FlowKnobs::initialize(bool randomize, bool isSimulated) {
 	init( TSC_YIELD_TIME,                                  1000000 );
 	init( MIN_LOGGED_PRIORITY_BUSY_FRACTION,                  0.05 );
 	init( CERT_FILE_MAX_SIZE,                      5 * 1024 * 1024 );
+	init( READY_QUEUE_RESERVED_SIZE,                          8192 );
 
 	//Network
 	init( PACKET_LIMIT,                                  100LL<<20 );
@@ -334,7 +343,7 @@ void Knobs::initKnob( bool& knob, bool value, std::string const& name ) {
 	}
 }
 
-void Knobs::trace() {
+void Knobs::trace() const {
 	for(auto &k : double_knobs)
 		TraceEvent("Knob").detail("Name", k.first.c_str()).detail("Value", *k.second);
 	for(auto &k : int_knobs)

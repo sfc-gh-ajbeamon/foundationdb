@@ -87,7 +87,7 @@ public: // variables
 public: // ctor & dtor
 	SnapTestWorkload(WorkloadContext const& wcx)
 	  : TestWorkload(wcx), numSnaps(0), maxSnapDelay(0.0), testID(0), snapUID() {
-		TraceEvent("SnapTestWorkload Constructor");
+		TraceEvent("SnapTestWorkloadConstructor");
 		std::string workloadName = "SnapTest";
 		maxRetryCntToRetrieveMessage = 10;
 
@@ -157,6 +157,7 @@ public: // workload functions
 		state Transaction tr(cx);
 		state vector<int64_t> keys;
 
+		keys.reserve(1000);
 		for (int i = 0; i < 1000; i++) {
 			keys.push_back(deterministicRandom()->randomInt64(0, INT64_MAX - 2));
 		}
@@ -223,6 +224,7 @@ public: // workload functions
 						snapFailed = true;
 						break;
 					}
+					wait(delay(5.0));
 				}
 			}
 			CSimpleIni ini;

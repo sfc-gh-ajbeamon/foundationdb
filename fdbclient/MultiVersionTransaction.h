@@ -65,7 +65,10 @@ struct FdbCApi : public ThreadSafeReferenceCounted<FdbCApi> {
 	//Database
 	fdb_error_t (*databaseCreateTransaction)(FDBDatabase *database, FDBTransaction **tr);
 	fdb_error_t (*databaseSetOption)(FDBDatabase *database, FDBDatabaseOptions::Option option, uint8_t const *value, int valueLength);
-	void (*databaseDestroy)(FDBDatabase *database);	
+	void (*databaseDestroy)(FDBDatabase *database);
+	FDBFuture* (*databaseRebootWorker)(FDBDatabase *database, uint8_t const *address, int addressLength, fdb_bool_t check, int duration);
+	FDBFuture* (*databaseForceRecoveryWithDataLoss)(FDBDatabase *database, uint8_t const *dcid, int dcidLength);
+    FDBFuture* (*databaseCreateSnapshot)(FDBDatabase *database, uint8_t const *uid, int uidLength, uint8_t const *snapshotCommmand, int snapshotCommandLength);
 
 	//Transaction
 	fdb_error_t (*transactionSetOption)(FDBTransaction *tr, FDBTransactionOptions::Option option, uint8_t const *value, int valueLength);
@@ -109,6 +112,7 @@ struct FdbCApi : public ThreadSafeReferenceCounted<FdbCApi> {
 	fdb_error_t (*futureGetDatabase)(FDBFuture *f, FDBDatabase **outDb);
 	fdb_error_t (*futureGetInt64)(FDBFuture *f, int64_t *outValue);
 	fdb_error_t (*futureGetUInt64)(FDBFuture *f, uint64_t *outValue);
+	fdb_error_t (*futureGetBool) (FDBFuture *f, bool *outValue);
 	fdb_error_t (*futureGetError)(FDBFuture *f);
 	fdb_error_t (*futureGetKey)(FDBFuture *f, uint8_t const **outKey, int *outKeyLength);
 	fdb_error_t (*futureGetValue)(FDBFuture *f, fdb_bool_t *outPresent, uint8_t const **outValue, int *outValueLength);
@@ -129,7 +133,7 @@ struct FdbCApi : public ThreadSafeReferenceCounted<FdbCApi> {
 class DLTransaction : public ITransaction, ThreadSafeReferenceCounted<DLTransaction> {
 public:
 	DLTransaction(Reference<FdbCApi> api, FdbCApi::FDBTransaction *tr) : api(api), tr(tr) {}
-	~DLTransaction() { api->transactionDestroy(tr); }
+	~DLTransaction() override { api->transactionDestroy(tr); }
 
 	void cancel() override;
 	void setVersion(Version v) override;
@@ -180,7 +184,7 @@ class DLDatabase : public IDatabase, ThreadSafeReferenceCounted<DLDatabase> {
 public:
 	DLDatabase(Reference<FdbCApi> api, FdbCApi::FDBDatabase *db) : api(api), db(db), ready(Void()) {}
 	DLDatabase(Reference<FdbCApi> api, ThreadFuture<FdbCApi::FDBDatabase*> dbFuture);
-	~DLDatabase() {
+	~DLDatabase() override {
 		if (db) {
 			api->databaseDestroy(db);
 		}
@@ -194,6 +198,10 @@ public:
 	void addref() override { ThreadSafeReferenceCounted<DLDatabase>::addref(); }
 	void delref() override { ThreadSafeReferenceCounted<DLDatabase>::delref(); }
 
+	ThreadFuture<int64_t> rebootWorker(const StringRef& address, bool check, int duration) override;
+	ThreadFuture<Void> forceRecoveryWithDataLoss(const StringRef& dcid) override;
+	ThreadFuture<Void> createSnapshot(const StringRef& uid, const StringRef& snapshot_command) override;
+
 private:
 	const Reference<FdbCApi> api;
 	FdbCApi::FDBDatabase* db; // Always set if API version >= 610, otherwise guaranteed to be set when onReady future is set
@@ -202,7 +210,7 @@ private:
 
 class DLApi : public IClientApi {
 public:
-	DLApi(std::string fdbCPath);
+	DLApi(std::string fdbCPath, bool unlinkOnLoad = false);
 
 	void selectApiVersion(int apiVersion) override;
 	const char* getClientVersion() override;
@@ -221,6 +229,7 @@ public:
 private:
 	const std::string fdbCPath;
 	const Reference<FdbCApi> api;
+	const bool unlinkOnLoad;
 	int headerVersion;
 	bool networkSetup;
 
@@ -294,18 +303,24 @@ private:
 	std::vector<std::pair<FDBTransactionOptions::Option, Optional<Standalone<StringRef>>>> persistentOptions;
 };
 
-struct ClientInfo : ThreadSafeReferenceCounted<ClientInfo> {
+struct ClientDesc {
+	std::string const libPath;
+	bool const external;
+
+	ClientDesc(std::string libPath, bool external) : libPath(libPath), external(external) {}
+};
+
+struct ClientInfo : ClientDesc, ThreadSafeReferenceCounted<ClientInfo> {
 	ProtocolVersion protocolVersion;
 	std::string clientVersion;
 	IClientApi *api;
-	std::string libPath;
-	bool external;
 	bool failed;
 	std::vector<std::pair<void (*)(void*), void*>> threadCompletionHooks;
 
-	ClientInfo() : protocolVersion(0), api(nullptr), external(false), failed(true) {}
-	ClientInfo(IClientApi *api) : protocolVersion(0), api(api), libPath("internal"), external(false), failed(false) {}
-	ClientInfo(IClientApi *api, std::string libPath) : protocolVersion(0), api(api), libPath(libPath), external(true), failed(false) {}
+	ClientInfo() : ClientDesc(std::string(), false), protocolVersion(0), api(nullptr), failed(true) {}
+	ClientInfo(IClientApi* api) : ClientDesc("internal", false), protocolVersion(0), api(api), failed(false) {}
+	ClientInfo(IClientApi* api, std::string libPath)
+	  : ClientDesc(libPath, true), protocolVersion(0), api(api), failed(false) {}
 
 	void loadProtocolVersion();
 	bool canReplace(Reference<ClientInfo> other) const;
@@ -315,8 +330,9 @@ class MultiVersionApi;
 
 class MultiVersionDatabase final : public IDatabase, ThreadSafeReferenceCounted<MultiVersionDatabase> {
 public:
-	MultiVersionDatabase(MultiVersionApi *api, std::string clusterFilePath, Reference<IDatabase> db, bool openConnectors=true);
-	~MultiVersionDatabase();
+	MultiVersionDatabase(MultiVersionApi* api, int threadIdx, std::string clusterFilePath, Reference<IDatabase> db,
+	                     bool openConnectors = true);
+	~MultiVersionDatabase() override;
 
 	Reference<ITransaction> createTransaction() override;
 	void setOption(FDBDatabaseOptions::Option option, Optional<StringRef> value = Optional<StringRef>()) override;
@@ -325,6 +341,10 @@ public:
 	void delref() override { ThreadSafeReferenceCounted<MultiVersionDatabase>::delref(); }
 
 	static Reference<IDatabase> debugCreateFromExistingDatabase(Reference<IDatabase> db);
+
+	ThreadFuture<int64_t> rebootWorker(const StringRef& address, bool check, int duration) override;
+	ThreadFuture<Void> forceRecoveryWithDataLoss(const StringRef& dcid) override;
+	ThreadFuture<Void> createSnapshot(const StringRef& uid, const StringRef& snapshot_command) override;
 
 // TODO: had to expose this to allow DatabaseState to be accessed within an ACTOR.
 // also could introduce some public functions to expose the underlying logic (ie currentClientIndex and Connector).
@@ -398,6 +418,7 @@ public:
 	
 	const Reference<DatabaseState> dbState;
 	const Reference<ProtocolVersionManager> protocolVersionManager;
+	const int threadIdx;
 	friend class MultiVersionTransaction;
 };
 
@@ -417,7 +438,9 @@ public:
 	static MultiVersionApi* api;
 
 	Reference<ClientInfo> getLocalClient();
-	void runOnExternalClients(std::function<void(Reference<ClientInfo>)>, bool runOnFailedClients=false);
+	void runOnExternalClients(int threadId, std::function<void(Reference<ClientInfo>)>,
+	                          bool runOnFailedClients = false);
+	void runOnExternalClientsAllThreads(std::function<void(Reference<ClientInfo>)>, bool runOnFailedClients = false);
 
 	void updateSupportedVersions();
 
@@ -437,6 +460,9 @@ private:
 	void setCallbacksOnExternalThreads();
 	void addExternalLibrary(std::string path);
 	void addExternalLibraryDirectory(std::string path);
+	// Return a vector of (pathname, unlink_on_close) pairs.  Makes threadCount - 1 copies of the library stored in path,
+	// and returns a vector of length threadCount.
+	std::vector<std::pair<std::string, bool>> copyExternalLibraryPerThread(std::string path);
 	void disableLocalClient();
 	void loadExternalClientVersion(Reference<ClientInfo> client);
 	void setupExternalClientNetwork(Reference<ClientInfo> client);
@@ -444,10 +470,13 @@ private:
 
 	void setNetworkOptionInternal(FDBNetworkOptions::Option option, Optional<StringRef> value);
 
-	Reference<ClientInfo> localClient;
-	std::map<std::string, Reference<ClientInfo>> externalClients;
+	void setupExternalClient(std::string path);
 
-	std::unordered_map<std::string, Reference<MultiVersionDatabase>> multiVersionDatabases;
+	Reference<ClientInfo> localClient;
+	std::map<std::string, ClientDesc> externalClientDescriptions;
+	std::map<std::string, std::vector<Reference<ClientInfo>>> externalClients;
+
+	std::unordered_map<int, std::vector<Reference<MultiVersionDatabase>>> multiVersionDatabases;
 	PromiseStream<Void> externalClientStream;
 
 	std::vector<THREAD_HANDLE> threadHandles;
@@ -456,6 +485,9 @@ private:
 	std::atomic<bool> multiClientDisabled;
 	std::atomic<bool> externalClient;
 	int apiVersion;
+
+	int nextThread = 0;
+	int threadCount;
 
 	Mutex lock;
 	std::vector<std::pair<FDBNetworkOptions::Option, Optional<Standalone<StringRef>>>> options;

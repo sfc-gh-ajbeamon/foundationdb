@@ -19,47 +19,37 @@
  */
 
 #include "fdbserver/workloads/workloads.actor.h"
+#include "flow/actorcompiler.h" // This must be the last include
 
 struct ProtocolVersionWorkload : TestWorkload {
-    ProtocolVersionWorkload(WorkloadContext const& wcx)
-	: TestWorkload(wcx) {
-        
-    }
+	ProtocolVersionWorkload(WorkloadContext const& wcx) : TestWorkload(wcx) {}
 
-	std::string description() const override {
-		return "ProtocolVersionWorkload";
+	std::string description() const override { return "ProtocolVersionWorkload"; }
+
+	Future<Void> start(Database const& cx) override { return _start(this, cx); }
+
+	ACTOR Future<Void> _start(ProtocolVersionWorkload* self, Database cx) {
+		state ISimulator::ProcessInfo* currProcess = g_pSimulator->getCurrentProcess();
+		state std::vector<ISimulator::ProcessInfo*> allProcesses = g_pSimulator->getAllProcesses();
+		state std::vector<ISimulator::ProcessInfo*>::iterator diffVersionProcess = find_if(allProcesses.begin(), allProcesses.end(), [](const ISimulator::ProcessInfo* p){
+			return p->protocolVersion != currentProtocolVersion;
+		});
+		
+		ASSERT(diffVersionProcess != allProcesses.end());
+
+		wait(g_pSimulator->onProcess(*diffVersionProcess));
+		uint64_t version = wait(getCoordinatorProtocols(cx->getConnectionFile(), Optional<ProtocolVersion>()));
+		ASSERT(version != g_network->protocolVersion().version());
+
+		// switch back to protocol-compatible process for consistency check
+		wait(g_pSimulator->onProcess(currProcess));
+
+		return Void();
 	}
 
-	Future<Void> start(Database const& cx) override {
-       return _start(this, cx);
-	}
+	Future<bool> check(Database const& cx) override { return true; }
 
-    ACTOR Future<Void> _start(ProtocolVersionWorkload* self, Database cx) {
-        state ISimulator::ProcessInfo* currProcess = g_pSimulator->getCurrentProcess();
-        state std::vector<ISimulator::ProcessInfo*> allProcesses = g_pSimulator->getAllProcesses();
-        state std::vector<ISimulator::ProcessInfo*>::iterator diffVersionProcess = find_if(allProcesses.begin(), allProcesses.end(), [](const ISimulator::ProcessInfo* p){
-            return p->protocolVersion != currentProtocolVersion;
-        });
-        
-        ASSERT(diffVersionProcess != allProcesses.end());
-
-        wait(g_pSimulator->onProcess(*diffVersionProcess));
-        uint64_t version = wait(getCoordinatorProtocols(cx->getConnectionFile(), Optional<ProtocolVersion>()));
-        ASSERT(version != g_network->protocolVersion().version());
-
-        // switch back to protocol-compatible process for consistency check
-        wait(g_pSimulator->onProcess(currProcess));
-
-        return Void();
-	}
-
-    Future<bool> check(Database const& cx) override {
-		return true;
-	}
-
-	void getMetrics(vector<PerfMetric>& m) override {
-	}
+	void getMetrics(vector<PerfMetric>& m) override {}
 };
 
 WorkloadFactory<ProtocolVersionWorkload> ProtocolVersionWorkloadFactory("ProtocolVersion");
- 

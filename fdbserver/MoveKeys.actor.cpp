@@ -178,12 +178,14 @@ ACTOR Future<vector<UID>> addReadWriteDestinations(KeyRangeRef shard, vector<Sto
 	}
 
 	state vector< Future<Optional<UID>> > srcChecks;
-	for(int s=0; s<srcInterfs.size(); s++) {
+	srcChecks.reserve(srcInterfs.size());
+	for (int s = 0; s < srcInterfs.size(); s++) {
 		srcChecks.push_back( checkReadWrite( srcInterfs[s].getShardState.getReplyUnlessFailedFor( GetShardStateRequest( shard, GetShardStateRequest::NO_WAIT), SERVER_KNOBS->SERVER_READY_QUORUM_INTERVAL, 0, TaskPriority::MoveKeys ), srcInterfs[s].id(), 0 ) );
 	}
 
 	state vector< Future<Optional<UID>> > destChecks;
-	for(int s=0; s<destInterfs.size(); s++) {
+	destChecks.reserve(destInterfs.size());
+	for (int s = 0; s < destInterfs.size(); s++) {
 		destChecks.push_back( checkReadWrite( destInterfs[s].getShardState.getReplyUnlessFailedFor( GetShardStateRequest( shard, GetShardStateRequest::NO_WAIT), SERVER_KNOBS->SERVER_READY_QUORUM_INTERVAL, 0, TaskPriority::MoveKeys ), destInterfs[s].id(), version ) );
 	}
 
@@ -237,7 +239,6 @@ ACTOR Future<vector<vector<UID>>> additionalSources(Standalone<RangeResultRef> s
 
 	std::map<UID, StorageServerInterface> ssiMap;
 	for(int s=0; s<serverListValues.size(); s++) {
-		auto si = decodeServerListValue(serverListValues[s].get());
 		StorageServerInterface ssi = decodeServerListValue(serverListValues[s].get());
 		ssiMap[ssi.id()] = ssi;
 	}
@@ -252,12 +253,13 @@ ACTOR Future<vector<vector<UID>>> additionalSources(Standalone<RangeResultRef> s
 
 		decodeKeyServersValue( UIDtoTagMap, shards[i].value, src, dest );
 
-		for(int s=0; s<src.size(); s++) {
+		srcInterfs.reserve(src.size());
+		for (int s = 0; s < src.size(); s++) {
 			srcInterfs.push_back( ssiMap[src[s]] );
 		}
 
 		for(int s=0; s<dest.size(); s++) {
-			if( std::find(src.begin(), src.end(), dest[s]) == dest.end() ) {
+			if (std::find(src.begin(), src.end(), dest[s]) == src.end()) {
 				destInterfs.push_back( ssiMap[dest[s]] );
 			}
 		}
@@ -326,7 +328,8 @@ ACTOR static Future<Void> startMoveKeys(Database occ, KeyRange keys, vector<UID>
 					wait(checkMoveKeysLock(&tr, lock, ddEnabledState));
 
 					vector< Future< Optional<Value> > > serverListEntries;
-					for(int s=0; s<servers.size(); s++)
+					serverListEntries.reserve(servers.size());
+					for (int s = 0; s < servers.size(); s++)
 						serverListEntries.push_back( tr.get( serverListKeyFor(servers[s]) ) );
 					state vector<Optional<Value>> serverListValues = wait( getAll(serverListEntries) );
 
@@ -490,8 +493,8 @@ ACTOR Future<Void> checkFetchingState( Database cx, vector<UID> dest, KeyRange k
 			tr.setOption(FDBTransactionOptions::PRIORITY_SYSTEM_IMMEDIATE);
 
 			vector< Future< Optional<Value> > > serverListEntries;
-			for(int s=0; s<dest.size(); s++)
-				serverListEntries.push_back( tr.get( serverListKeyFor(dest[s]) ) );
+			serverListEntries.reserve(dest.size());
+			for (int s = 0; s < dest.size(); s++) serverListEntries.push_back(tr.get(serverListKeyFor(dest[s])));
 			state vector<Optional<Value>> serverListValues = wait( getAll(serverListEntries) );
 			vector<Future<Void>> requests;
 			for(int s=0; s<serverListValues.size(); s++) {
@@ -697,7 +700,8 @@ ACTOR static Future<Void> finishMoveKeys(Database occ, KeyRange keys, vector<UID
 					// for smartQuorum
 					state vector<StorageServerInterface> storageServerInterfaces;
 					vector< Future< Optional<Value> > > serverListEntries;
-					for(int s=0; s<newDestinations.size(); s++)
+					serverListEntries.reserve(newDestinations.size());
+					for (int s = 0; s < newDestinations.size(); s++)
 						serverListEntries.push_back( tr.get( serverListKeyFor(newDestinations[s]) ) );
 					state vector<Optional<Value>> serverListValues = wait( getAll(serverListEntries) );
 
@@ -711,7 +715,8 @@ ACTOR static Future<Void> finishMoveKeys(Database occ, KeyRange keys, vector<UID
 					}
 
 					// Wait for new destination servers to fetch the keys
-					for(int s=0; s<storageServerInterfaces.size(); s++)
+					serverReady.reserve(storageServerInterfaces.size());
+					for (int s = 0; s < storageServerInterfaces.size(); s++)
 						serverReady.push_back( waitForShardReady( storageServerInterfaces[s], keys, tr.getReadVersion().get(), GetShardStateRequest::READABLE) );
 					wait( timeout( waitForAll( serverReady ), SERVER_KNOBS->SERVER_READY_QUORUM_TIMEOUT, Void(), TaskPriority::MoveKeys ) );
 					int count = dest.size() - newDestinations.size();
@@ -1099,8 +1104,8 @@ void seedShardServers(
 	}
 
 	std::vector<Tag> serverTags;
-	for(int i=0;i<servers.size();i++)
-		serverTags.push_back(server_tag[servers[i].id()]);
+	serverTags.reserve(servers.size());
+	for (int i = 0; i < servers.size(); i++) serverTags.push_back(server_tag[servers[i].id()]);
 
 	// We have to set this range in two blocks, because the master tracking of "keyServersLocations" depends on a change to a specific
 	//   key (keyServersKeyServersKey)

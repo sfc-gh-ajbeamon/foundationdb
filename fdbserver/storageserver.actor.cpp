@@ -62,6 +62,7 @@
 #include "fdbrpc/Smoother.h"
 #include "fdbrpc/Stats.h"
 #include "flow/TDMetric.actor.h"
+#include "flow/genericactors.actor.h"
 
 #include "flow/actorcompiler.h"  // This must be the last #include.
 
@@ -77,6 +78,7 @@ inline bool canReplyWith(Error e) {
 		case error_code_future_version:
 		case error_code_wrong_shard_server:
 		case error_code_process_behind:
+		case error_code_watch_cancelled:
 		//case error_code_all_alternatives_failed:
 			return true;
 		default:
@@ -118,25 +120,22 @@ struct AddingShard : NonCopyable {
 	bool isTransferred() const { return phase == Waiting; }
 };
 
-struct ShardInfo : ReferenceCounted<ShardInfo>, NonCopyable {
-	AddingShard* adding;
+class ShardInfo : public ReferenceCounted<ShardInfo>, NonCopyable {
+	ShardInfo(KeyRange keys, std::unique_ptr<AddingShard> &&adding, StorageServer* readWrite)
+		: adding(std::move(adding)), readWrite(readWrite), keys(keys)
+	{
+	}
+
+public:
+	std::unique_ptr<AddingShard> adding;
 	struct StorageServer* readWrite;
 	KeyRange keys;
 	uint64_t changeCounter;
 
-	ShardInfo(KeyRange keys, AddingShard* adding, StorageServer* readWrite)
-		: adding(adding), readWrite(readWrite), keys(keys)
-	{
-	}
-
-	~ShardInfo() {
-		delete adding;
-	}
-
 	static ShardInfo* newNotAssigned(KeyRange keys) { return new ShardInfo(keys, nullptr, nullptr); }
 	static ShardInfo* newReadWrite(KeyRange keys, StorageServer* data) { return new ShardInfo(keys, nullptr, data); }
-	static ShardInfo* newAdding(StorageServer* data, KeyRange keys) { return new ShardInfo(keys, new AddingShard(data, keys), nullptr); }
-	static ShardInfo* addingSplitLeft( KeyRange keys, AddingShard* oldShard) { return new ShardInfo(keys, new AddingShard(oldShard, keys), nullptr); }
+	static ShardInfo* newAdding(StorageServer* data, KeyRange keys) { return new ShardInfo(keys, std::make_unique<AddingShard>(data, keys), nullptr); }
+	static ShardInfo* addingSplitLeft( KeyRange keys, AddingShard* oldShard) { return new ShardInfo(keys, std::make_unique<AddingShard>(oldShard, keys), nullptr); }
 
 	bool isReadable() const { return readWrite!=nullptr; }
 	bool notAssigned() const { return !readWrite && !adding; }
@@ -262,6 +261,21 @@ struct FetchInjectionInfo {
 	vector<VerUpdateRef> changes;
 };
 
+class ServerWatchMetadata: public ReferenceCounted<ServerWatchMetadata> {
+public:
+	Key key;
+	Optional<Value> value;
+	Version version;
+	Future<Version> watch_impl;
+	Promise<Version> versionPromise;
+	Optional<TagSet> tags;
+	Optional<UID> debugID;
+
+
+	ServerWatchMetadata(Key key, Optional<Value> value, Version version, Optional<TagSet> tags, Optional<UID> debugID)
+		: key(key), value(value), version(version), tags(tags), debugID(debugID) {}
+};
+
 struct StorageServer {
 	typedef VersionedMap<KeyRef, ValueOrClearToRef> VersionedData;
 
@@ -289,6 +303,7 @@ private:
 
 	VersionedData versionedData;
 	std::map<Version, Standalone<VerUpdateRef>> mutationLog; // versions (durableVersion, version]
+	std::unordered_map<KeyRef, Reference<ServerWatchMetadata>> watchMap; // keep track of server watches
 
 public:
 public:
@@ -307,14 +322,20 @@ public:
 		                                      Histogram::Unit::bytes_per_second)) {}
 	} fetchKeysHistograms;
 
+	// watch map operations
+	Reference<ServerWatchMetadata> getWatchMetadata(KeyRef key) const;
+	KeyRef setWatchMetadata(Reference<ServerWatchMetadata> metadata);
+	void deleteWatchMetadata(KeyRef key);
+	void clearWatchMetadata();
+
 	class CurrentRunningFetchKeys {
 		std::unordered_map<UID, double> startTimeMap;
-		std::unordered_map<UID, KeyRangeRef> keyRangeMap;
+		std::unordered_map<UID, KeyRange> keyRangeMap;
 
 		static const StringRef emptyString;
 		static const KeyRangeRef emptyKeyRange;
 	public:
-		void recordStart(const UID id, const KeyRange keyRange) {
+		void recordStart(const UID id, const KeyRange& keyRange) {
 			startTimeMap[id] =  now();
 			keyRangeMap[id] = keyRange;
 		}
@@ -324,7 +345,7 @@ public:
 			keyRangeMap.erase(id);
 		}
 
-		std::pair<double, KeyRangeRef> longestTime() const {
+		std::pair<double, KeyRange> longestTime() const {
 			if (numRunning() == 0) {
 				return {-1, emptyKeyRange};
 			}
@@ -332,7 +353,7 @@ public:
 			const double currentTime = now();
 			double longest = 0;
 			UID UIDofLongest;
-			for (const auto kv: startTimeMap) {
+			for (const auto& kv: startTimeMap) {
 				const double currentRunningTime = currentTime - kv.second;
 				if (longest < currentRunningTime) {
 					longest = currentRunningTime;
@@ -587,7 +608,7 @@ public:
 
 	struct Counters {
 		CounterCollection cc;
-		Counter allQueries, getKeyQueries, getValueQueries, getRangeQueries, finishedQueries, rowsQueried, bytesQueried, watchQueries, emptyQueries;
+		Counter allQueries, getKeyQueries, getValueQueries, getRangeQueries, finishedQueries, lowPriorityQueries, rowsQueried, bytesQueried, watchQueries, emptyQueries;
 		Counter bytesInput, bytesDurable, bytesFetched,
 			mutationBytes;  // Like bytesInput but without MVCC accounting
 		Counter sampledBytesCleared;
@@ -607,6 +628,7 @@ public:
 			getRangeQueries("GetRangeQueries", cc),
 			allQueries("QueryQueue", cc),
 			finishedQueries("FinishedQueries", cc),
+			lowPriorityQueries("LowPriorityQueries", cc),
 			rowsQueried("RowsQueried", cc),
 			bytesQueried("BytesQueried", cc),
 			watchQueries("WatchQueries", cc),
@@ -746,11 +768,24 @@ public:
 		return counters.bytesInput.getValue() - counters.bytesDurable.getValue();
 	}
 
+	// penalty used by loadBalance() to balance requests among SSes. We prefer SS with less write queue size.
 	double getPenalty() {
 		return std::max(std::max(1.0, (queueSize() - (SERVER_KNOBS->TARGET_BYTES_PER_STORAGE_SERVER -
 													  2.0 * SERVER_KNOBS->SPRING_BYTES_STORAGE_SERVER)) /
 								 SERVER_KNOBS->SPRING_BYTES_STORAGE_SERVER),
 						(currentRate() < 1e-6 ? 1e6 : 1.0 / currentRate()));
+	}
+
+	// Normally the storage server prefers to serve read requests over making mutations
+	// durable to disk. However, when the storage server falls to far behind on
+	// making mutations durable, this function will change the priority to prefer writes.
+	Future<Void> getQueryDelay() {
+		if ((version.get() - durableVersion.get() > SERVER_KNOBS->LOW_PRIORITY_DURABILITY_LAG) ||
+		    (queueSize() > SERVER_KNOBS->LOW_PRIORITY_STORAGE_QUEUE_BYTES)) {
+			++counters.lowPriorityQueries;
+			return delay(0, TaskPriority::LowPriorityRead);
+		}
+		return delay(0, TaskPriority::DefaultEndpoint);
 	}
 
 	template<class Reply>
@@ -771,13 +806,21 @@ public:
 		promise.sendError(err);
 	}
 
-	template<class Request, class HandleFunction>
-	Future<Void> readGuard(const Request& request, const HandleFunction& fun) {
+	template<class Request>
+	bool shouldRead(const Request& request) {
 		auto rate = currentRate();
 		if (rate < SERVER_KNOBS->STORAGE_DURABILITY_LAG_REJECT_THRESHOLD && deterministicRandom()->random01() > std::max(SERVER_KNOBS->STORAGE_DURABILITY_LAG_MIN_RATE, rate/SERVER_KNOBS->STORAGE_DURABILITY_LAG_REJECT_THRESHOLD)) {
-			//request.error = future_version();
 			sendErrorWithPenalty(request.reply, server_overloaded(), getPenalty());
 			++counters.readsRejected;
+			return false;
+		}
+		return true;
+	}
+
+	template<class Request, class HandleFunction>
+	Future<Void> readGuard(const Request& request, const HandleFunction& fun) {
+		bool read = shouldRead(request);
+		if (!read) {
 			return Void();
 		}
 		return fun(this, request);
@@ -802,6 +845,28 @@ void StorageServer::byteSampleApplyMutation( MutationRef const& m, Version ver )
 		byteSampleApplySet( KeyValueRef(m.param1, m.param2), ver );
 	else
 		ASSERT(false); // Mutation of unknown type modfying byte sample
+}
+
+// watchMap Operations
+Reference<ServerWatchMetadata> StorageServer::getWatchMetadata(KeyRef key) const {
+	const auto it = watchMap.find(key);
+	if (it == watchMap.end()) return Reference<ServerWatchMetadata>();
+	return it->second;
+}
+
+KeyRef StorageServer::setWatchMetadata(Reference<ServerWatchMetadata> metadata) {
+	KeyRef keyRef = metadata->key.contents();
+	
+	watchMap[keyRef] = metadata;
+	return keyRef;
+}
+
+void StorageServer::deleteWatchMetadata(KeyRef key) {
+	watchMap.erase(key);
+}
+
+void StorageServer::clearWatchMetadata() {
+	watchMap.clear();
 }
 
 #ifndef __INTEL_COMPILER
@@ -974,6 +1039,7 @@ ACTOR Future<Version> waitForVersionNoTooOld( StorageServer* data, Version versi
 ACTOR Future<Void> getValueQ( StorageServer* data, GetValueRequest req ) {
 	state int64_t resultSize = 0;
 	Span span("SS:getValue"_loc, { req.spanContext });
+	span.addTag("key"_sr, req.key);
 
 	try {
 		++data->counters.getValueQueries;
@@ -983,7 +1049,7 @@ ACTOR Future<Void> getValueQ( StorageServer* data, GetValueRequest req ) {
 
 		// Active load balancing runs at a very high priority (to obtain accurate queue lengths)
 		// so we need to downgrade here
-		wait( delay(0, TaskPriority::DefaultEndpoint) );
+		wait( data->getQueryDelay() );
 
 		if( req.debugID.present() )
 			g_traceBatch.addEvent("GetValueDebug", req.debugID.get().first(), "getValueQ.DoRead"); //.detail("TaskID", g_network->getCurrentTask());
@@ -1079,100 +1145,102 @@ ACTOR Future<Void> getValueQ( StorageServer* data, GetValueRequest req ) {
 // Pessimistic estimate the number of overhead bytes used by each
 // watch. Watch key references are stored in an AsyncMap<Key,bool>, and actors
 // must be kept alive until the watch is finished.
-static constexpr size_t WATCH_OVERHEAD_BYTES = 1000;
+extern size_t WATCH_OVERHEAD_WATCHQ, WATCH_OVERHEAD_WATCHIMPL;
 
-ACTOR Future<Void> watchValue_impl( StorageServer* data, WatchValueRequest req, SpanID parent ) {
-	state Location spanLocation = "SS:WatchValueImpl"_loc;
+ACTOR Future<Version> watchWaitForValueChange( StorageServer* data, SpanID parent, KeyRef key ) {
+	state Location spanLocation = "SS:watchWaitForValueChange"_loc;
 	state Span span(spanLocation, { parent });
-	try {
-		++data->counters.watchQueries;
+	state Reference<ServerWatchMetadata> metadata = data->getWatchMetadata(key);
 
-		if( req.debugID.present() )
-			g_traceBatch.addEvent("WatchValueDebug", req.debugID.get().first(), "watchValueQ.Before"); //.detail("TaskID", g_network->getCurrentTask());
+	if( metadata->debugID.present() )
+		g_traceBatch.addEvent("WatchValueDebug", metadata->debugID.get().first(), "watchValueSendReply.Before"); //.detail("TaskID", g_network->getCurrentTask());
 
-		wait(success(waitForVersionNoTooOld(data, req.version)));
-		if( req.debugID.present() )
-			g_traceBatch.addEvent("WatchValueDebug", req.debugID.get().first(), "watchValueQ.AfterVersion"); //.detail("TaskID", g_network->getCurrentTask());
+	wait(success(waitForVersionNoTooOld(data, metadata->version)));
+	if( metadata->debugID.present() )
+		g_traceBatch.addEvent("WatchValueDebug", metadata->debugID.get().first(), "watchValueSendReply.AfterVersion"); //.detail("TaskID", g_network->getCurrentTask());
 
-		state Version minVersion = data->data().latestVersion;
-		state Future<Void> watchFuture = data->watches.onChange(req.key);
-		loop {
-			try {
-				state Version latest = data->version.get();
-				TEST(latest >= minVersion && latest < data->data().latestVersion); // Starting watch loop with latestVersion > data->version
-				GetValueRequest getReq( span.context, req.key, latest, req.tags, req.debugID );
-				state Future<Void> getValue = getValueQ( data, getReq ); //we are relying on the delay zero at the top of getValueQ, if removed we need one here
-				GetValueReply reply = wait( getReq.reply.getFuture() );
-				span = Span(spanLocation, parent);
-				//TraceEvent("WatcherCheckValue").detail("Key",  req.key  ).detail("Value",  req.value  ).detail("CurrentValue",  v  ).detail("Ver", latest);
+	state Version minVersion = data->data().latestVersion;
+	state Future<Void> watchFuture = data->watches.onChange(metadata->key);
+	loop {
+		try {
+			metadata = data->getWatchMetadata(key);
+			state Version latest = data->version.get();
+			TEST(latest >= minVersion && latest < data->data().latestVersion); // Starting watch loop with latestVersion > data->version
+			GetValueRequest getReq( span.context, metadata->key, latest, metadata->tags, metadata->debugID );
+			state Future<Void> getValue = getValueQ( data, getReq ); //we are relying on the delay zero at the top of getValueQ, if removed we need one here
+			GetValueReply reply = wait( getReq.reply.getFuture() );
+			span = Span(spanLocation, parent);
 
-				if(reply.error.present()) {
-					ASSERT(reply.error.get().code() != error_code_future_version);
-					throw reply.error.get();
-				}
-				if(BUGGIFY) {
-					throw transaction_too_old();
-				}
-				
-				DEBUG_MUTATION("ShardWatchValue", latest, MutationRef(MutationRef::DebugKey, req.key, reply.value.present() ? StringRef( reply.value.get() ) : LiteralStringRef("<null>") ) );
+			if(reply.error.present()) {
+				ASSERT(reply.error.get().code() != error_code_future_version);
+				throw reply.error.get();
+			}
+			if(BUGGIFY) {
+				throw transaction_too_old();
+			}
+			
+			DEBUG_MUTATION("ShardWatchValue", latest, MutationRef(MutationRef::DebugKey, metadata->key, reply.value.present() ? StringRef( reply.value.get() ) : LiteralStringRef("<null>") ) );
 
-				if( req.debugID.present() )
-					g_traceBatch.addEvent("WatchValueDebug", req.debugID.get().first(), "watchValueQ.AfterRead"); //.detail("TaskID", g_network->getCurrentTask());
+			if( metadata->debugID.present() )
+				g_traceBatch.addEvent("WatchValueDebug", metadata->debugID.get().first(), "watchValueSendReply.AfterRead"); //.detail("TaskID", g_network->getCurrentTask());
 
-				if( reply.value != req.value ) {
-					req.reply.send(WatchValueReply{ latest });
-					return Void();
-				}
-
-				if( data->watchBytes > SERVER_KNOBS->MAX_STORAGE_SERVER_WATCH_BYTES ) {
-					TEST(true); //Too many watches, reverting to polling
-					data->sendErrorWithPenalty(req.reply, watch_cancelled(), data->getPenalty());
-					return Void();
-				}
-
-				++data->numWatches;
-				data->watchBytes += (req.key.expectedSize() + req.value.expectedSize() + WATCH_OVERHEAD_BYTES);
-				try {
-					if(latest < minVersion) {
-						// If the version we read is less than minVersion, then we may fail to be notified of any changes that occur up to or including minVersion
-						// To prevent that, we'll check the key again once the version reaches our minVersion
-						watchFuture = watchFuture || data->version.whenAtLeast(minVersion);
-					}
-					if(BUGGIFY) {
-						// Simulate a trigger on the watch that results in the loop going around without the value changing
-						watchFuture = watchFuture || delay(deterministicRandom()->random01());
-					}
-					wait(watchFuture);
-					--data->numWatches;
-					data->watchBytes -= (req.key.expectedSize() + req.value.expectedSize() + WATCH_OVERHEAD_BYTES);
-				} catch( Error &e ) {
-					--data->numWatches;
-					data->watchBytes -= (req.key.expectedSize() + req.value.expectedSize() + WATCH_OVERHEAD_BYTES);
-					throw;
-				}
-			} catch( Error &e ) {
-				if( e.code() != error_code_transaction_too_old ) {
-					throw;
-				}
-
-				TEST(true); // Reading a watched key failed with transaction_too_old
+			if( reply.value != metadata->value && latest >= metadata->version ) {
+				return latest; // fire watch
 			}
 
-			watchFuture = data->watches.onChange(req.key);
-			wait(data->version.whenAtLeast(data->data().latestVersion));
+			if( data->watchBytes > SERVER_KNOBS->MAX_STORAGE_SERVER_WATCH_BYTES ) {
+				TEST(true); //Too many watches, reverting to polling
+				throw watch_cancelled();
+			}
+
+			state int64_t watchBytes = (metadata->key.expectedSize() + metadata->value.expectedSize() + key.expectedSize() +
+			     sizeof(Reference<ServerWatchMetadata>) + sizeof(ServerWatchMetadata) + WATCH_OVERHEAD_WATCHIMPL);
+
+			data->watchBytes += watchBytes;
+			try {
+				if(latest < minVersion) {
+					// If the version we read is less than minVersion, then we may fail to be notified of any changes that occur up to or including minVersion
+					// To prevent that, we'll check the key again once the version reaches our minVersion
+					watchFuture = watchFuture || data->version.whenAtLeast(minVersion);
+				}
+				if(BUGGIFY) {
+					// Simulate a trigger on the watch that results in the loop going around without the value changing
+					watchFuture = watchFuture || delay(deterministicRandom()->random01());
+				}
+				wait(watchFuture);
+				data->watchBytes -= watchBytes;
+			} catch( Error &e ) {
+				data->watchBytes -= watchBytes;
+				throw;
+			}
+		} catch( Error &e ) {
+			if( e.code() != error_code_transaction_too_old ) {
+				throw e;
+			}
+
+			TEST(true); // Reading a watched key failed with transaction_too_old
 		}
-	} catch (Error& e) {
-		if(!canReplyWith(e))
-			throw;
-		data->sendErrorWithPenalty(req.reply, e, data->getPenalty());
+
+		watchFuture = data->watches.onChange(metadata->key);
+		wait(data->version.whenAtLeast(data->data().latestVersion));
 	}
-	return Void();
 }
 
-ACTOR Future<Void> watchValueQ( StorageServer* data, WatchValueRequest req ) {
-	state Span span("SS:watchValue"_loc, { req.spanContext });
-	state Future<Void> watch = watchValue_impl( data, req, span.context );
+void checkCancelWatchImpl( StorageServer* data, WatchValueRequest req ) {
+	Reference<ServerWatchMetadata> metadata = data->getWatchMetadata(req.key.contents());
+	if(metadata.isValid() && metadata->versionPromise.getFutureReferenceCount() == 1) {
+		// last watch timed out so cancel watch_impl and delete key from the map
+		data->deleteWatchMetadata(req.key.contents());
+		metadata->watch_impl.cancel();
+	}
+}
+
+ACTOR Future<Void> watchValueSendReply(StorageServer* data, WatchValueRequest req, Future<Version> resp, SpanID spanContext) {
+	state Span span("SS:watchValue"_loc, { spanContext });
 	state double startTime = now();
+	++data->counters.watchQueries;
+	++data->numWatches;
+	data->watchBytes += WATCH_OVERHEAD_WATCHQ;
 
 	loop {
 		double timeoutDelay = -1;
@@ -1181,18 +1249,46 @@ ACTOR Future<Void> watchValueQ( StorageServer* data, WatchValueRequest req ) {
 		} else if(!BUGGIFY) {
 			timeoutDelay = std::max(CLIENT_KNOBS->WATCH_TIMEOUT - (now() - startTime), 0.0);
 		}
-		choose {
-			when( wait( watch ) ) {
-				return Void();
+
+		try {
+			choose {
+				when( Version ver = wait( resp ) ) {
+					// fire watch
+					req.reply.send(WatchValueReply{ ver });
+					checkCancelWatchImpl(data, req);
+					--data->numWatches;
+					data->watchBytes -= WATCH_OVERHEAD_WATCHQ;
+					return Void();
+				}
+				when( wait( timeoutDelay < 0 ? Never() : delay(timeoutDelay) ) ) {
+					// watch timed out
+					data->sendErrorWithPenalty(req.reply, timed_out(), data->getPenalty());
+					checkCancelWatchImpl(data, req);
+					--data->numWatches;
+					data->watchBytes -= WATCH_OVERHEAD_WATCHQ;
+					return Void();
+				}
+				when( wait( data->noRecentUpdates.onChange()) ) {}
 			}
-			when( wait( timeoutDelay < 0 ? Never() : delay(timeoutDelay) ) ) {
-				data->sendErrorWithPenalty(req.reply, timed_out(), data->getPenalty());
-				return Void();
-			}
-			when( wait( data->noRecentUpdates.onChange()) ) {}
+		} catch (Error& e) {
+			data->watchBytes -= WATCH_OVERHEAD_WATCHQ;
+			checkCancelWatchImpl(data, req);
+			--data->numWatches;
+
+			if (!canReplyWith(e)) throw e;
+			data->sendErrorWithPenalty(req.reply, e, data->getPenalty());
+			return Void();
 		}
 	}
 }
+
+#ifdef NO_INTELLISENSE
+size_t WATCH_OVERHEAD_WATCHQ = sizeof(WatchValueSendReplyActorState<WatchValueSendReplyActor>) + sizeof(WatchValueSendReplyActor);
+size_t WATCH_OVERHEAD_WATCHIMPL = sizeof(WatchWaitForValueChangeActorState<WatchWaitForValueChangeActor>) + sizeof(WatchWaitForValueChangeActor);
+#else
+size_t WATCH_OVERHEAD_WATCHQ = 0; // only used in IDE so value is irrelevant
+size_t WATCH_OVERHEAD_WATCHIMPL = 0;
+#endif
 
 ACTOR Future<Void> getShardState_impl( StorageServer* data, GetShardStateRequest req ) {
 	ASSERT( req.mode != GetShardStateRequest::NO_WAIT );
@@ -1564,13 +1660,10 @@ ACTOR Future<Void> getKeyValuesQ( StorageServer* data, GetKeyValuesRequest req )
 	// so we need to downgrade here
 	if (SERVER_KNOBS->FETCH_KEYS_LOWER_PRIORITY && req.isFetchKeys) {
 		wait( delay(0, TaskPriority::FetchKeys) );
-	// } else if (false) {
-	// 	// Placeholder for up-prioritizing fetches for important requests
-	// 	taskType = TaskPriority::DefaultDelay;
 	} else {
-		wait( delay(0, TaskPriority::DefaultEndpoint) );
+		wait( data->getQueryDelay() );
 	}
-	
+
 	try {
 		if( req.debugID.present() )
 			g_traceBatch.addEvent("TransactionDebug", req.debugID.get().first(), "storageserver.getKeyValues.Before");
@@ -1706,7 +1799,7 @@ ACTOR Future<Void> getKeyQ( StorageServer* data, GetKeyRequest req ) {
 
 	// Active load balancing runs at a very high priority (to obtain accurate queue lengths)
 	// so we need to downgrade here
-	wait( delay(0, TaskPriority::DefaultEndpoint) );
+	wait( data->getQueryDelay() );
 
 	try {
 		state Version version = wait( waitForVersion( data, req.version, req.spanContext ) );
@@ -2358,9 +2451,9 @@ ACTOR Future<Void> fetchKeys( StorageServer *data, AddingShard* shard ) {
 						// The remaining unfetched keys [nfk,keys.end) will become a separate AddingShard with its own fetchKeys.
 						shard->server->addShard( ShardInfo::addingSplitLeft( KeyRangeRef(keys.begin, nfk), shard ) );
 						shard->server->addShard( ShardInfo::newAdding( data, KeyRangeRef(nfk, keys.end) ) );
-						shard = data->shards.rangeContaining( keys.begin ).value()->adding;
+						shard = data->shards.rangeContaining( keys.begin ).value()->adding.get();
 						warningLogger = logFetchKeysWarning(shard);
-						AddingShard* otherShard = data->shards.rangeContaining( nfk ).value()->adding;
+						AddingShard* otherShard = data->shards.rangeContaining( nfk ).value()->adding.get();
 						keys = shard->keys;
 
 						// Split our prior updates.  The ones that apply to our new, restricted key range will go back into shard->updates,
@@ -2396,7 +2489,7 @@ ACTOR Future<Void> fetchKeys( StorageServer *data, AddingShard* shard ) {
 					//FIXME: remove when we no longer support upgrades from 5.X
 					if (debug_getRangeRetries >= 100) {
 						data->cx->enableLocalityLoadBalance = false;
-						// TODO: Add SevWarnAlways to say it was disabled.
+						TraceEvent(SevWarnAlways, "FKDisableLB").detail("FKID", fetchKeysID);
 					}
 
 					debug_getRangeRetries++;
@@ -2415,6 +2508,7 @@ ACTOR Future<Void> fetchKeys( StorageServer *data, AddingShard* shard ) {
 
 		//FIXME: remove when we no longer support upgrades from 5.X
 		data->cx->enableLocalityLoadBalance = true;
+		TraceEvent(SevWarnAlways, "FKReenableLB").detail("FKID", fetchKeysID);
 
 		// We have completed the fetch and write of the data, now we wait for MVCC window to pass.
 		//  As we have finished this work, we will allow more work to start...
@@ -2879,7 +2973,6 @@ private:
 ACTOR Future<Void> update( StorageServer* data, bool* pReceivedUpdate )
 {
 	state double start;
-	state Span span("SS:update"_loc);
 	try {
 		// If we are disk bound and durableVersion is very old, we need to block updates or we could run out of memory
 		// This is often referred to as the storage server e-brake (emergency brake)
@@ -3022,6 +3115,7 @@ ACTOR Future<Void> update( StorageServer* data, bool* pReceivedUpdate )
 
 		state Version ver = invalidVersion;
 		cloneCursor2->setProtocolVersion(data->logProtocol);
+		state SpanID spanContext = SpanID();
 		for (;cloneCursor2->hasMessage(); cloneCursor2->nextMessage()) {
 			if(mutationBytes > SERVER_KNOBS->DESIRED_UPDATE_BYTES) {
 				mutationBytes = 0;
@@ -3051,11 +3145,14 @@ ACTOR Future<Void> update( StorageServer* data, bool* pReceivedUpdate )
 			else if (rd.protocolVersion().hasSpanContext() && SpanContextMessage::isNextIn(rd)) {
 				SpanContextMessage scm;
 				rd >> scm;
-				span.addParent(scm.spanContext);
+				spanContext = scm.spanContext;
 			}
 			else {
 				MutationRef msg;
 				rd >> msg;
+
+				Span span("SS:update"_loc, { spanContext });
+				span.addTag("key"_sr, msg.param1);
 
 				if (ver != invalidVersion) {  // This change belongs to a version < minVersion
 					DEBUG_MUTATION("SSPeek", ver, msg).detail("ServerID", data->thisServerID);
@@ -3216,7 +3313,7 @@ ACTOR Future<Void> updateStorage(StorageServer* data) {
 			durableDelay = delay(SERVER_KNOBS->STORAGE_COMMIT_INTERVAL, TaskPriority::UpdateStorage);
 		}
 
-		wait(durable);
+		wait(ioTimeoutError(durable, SERVER_KNOBS->MAX_STORAGE_COMMIT_TIME));
 
 		debug_advanceMinCommittedVersion(data->thisServerID, newOldestVersion);
 
@@ -3878,12 +3975,99 @@ ACTOR Future<Void> serveGetKeyRequests( StorageServer* self, FutureStream<GetKey
 	}
 }
 
+ACTOR Future<Void> watchValueWaitForVersion( StorageServer* self, WatchValueRequest req, PromiseStream<WatchValueRequest> stream ) {
+	state Span span("SS:watchValueWaitForVersion"_loc, { req.spanContext });
+	try {
+		wait(success(waitForVersionNoTooOld(self, req.version)));
+		stream.send(req);
+	} catch (Error& e) {
+		if(!canReplyWith(e)) throw e;
+		self->sendErrorWithPenalty(req.reply, e, self->getPenalty());
+	}
+	return Void();
+}
+
+ACTOR Future<Void> serveWatchValueRequestsImpl( StorageServer* self, FutureStream<WatchValueRequest> stream ) {
+	loop {
+		state WatchValueRequest req = waitNext(stream);
+		state Reference<ServerWatchMetadata> metadata = self->getWatchMetadata(req.key.contents());
+		state Span span("SS:serveWatchValueRequestsImpl"_loc, { req.spanContext });
+
+		if (!metadata.isValid()) { // case 1: no watch set for the current key
+			metadata = makeReference<ServerWatchMetadata>(req.key, req.value, req.version, req.tags, req.debugID);
+			KeyRef key = self->setWatchMetadata(metadata);
+			metadata->watch_impl = forward(watchWaitForValueChange(self, span.context, key), metadata->versionPromise);
+			self->actors.add(watchValueSendReply(self, req, metadata->versionPromise.getFuture(), span.context));
+		}
+		else if (metadata->value == req.value) { // case 2: there is a watch in the map and it has the same value so just update version
+			if (req.version > metadata->version) {
+				metadata->version = req.version;
+				metadata->tags = req.tags;
+				metadata->debugID = req.debugID;
+			}
+			self->actors.add(watchValueSendReply(self, req, metadata->versionPromise.getFuture(), span.context));
+		}
+		else if (req.version > metadata->version) { // case 3: version in map has a lower version so trigger watch and create a new entry in map
+			self->deleteWatchMetadata(req.key.contents());
+			metadata->versionPromise.send(req.version);
+			metadata->watch_impl.cancel();
+
+			metadata = makeReference<ServerWatchMetadata>(req.key, req.value, req.version, req.tags, req.debugID);
+			KeyRef key = self->setWatchMetadata(metadata);
+			metadata->watch_impl = forward(watchWaitForValueChange(self, span.context, key), metadata->versionPromise);
+
+			self->actors.add(watchValueSendReply(self, req, metadata->versionPromise.getFuture(), span.context));
+		} else if (req.version < metadata->version) { // case 4: version in the map is higher so immediately trigger watch
+			TEST(true); // watch version in map is higher so trigger watch (case 4)
+			req.reply.send(WatchValueReply{ metadata->version });
+		} else { // case 5: watch value differs but their versions are the same (rare case) so check with the SS
+			TEST(true); // watch version in the map is the same but value is different (case 5)
+			loop {
+				try {
+					state Version latest = self->version.get();
+					GetValueRequest getReq( span.context, metadata->key, latest, metadata->tags, metadata->debugID );
+					state Future<Void> getValue = getValueQ( self, getReq );
+					GetValueReply reply = wait( getReq.reply.getFuture() );
+					metadata = self->getWatchMetadata(req.key.contents());
+
+					if (metadata.isValid() && reply.value != metadata->value) { // valSS != valMap
+						self->deleteWatchMetadata(req.key.contents());
+						metadata->versionPromise.send(req.version);
+						metadata->watch_impl.cancel();
+					}
+
+					if (reply.value == req.value) { // valSS == valreq
+						metadata = makeReference<ServerWatchMetadata>(req.key, req.value, req.version, req.tags, req.debugID);
+						KeyRef key = self->setWatchMetadata(metadata);
+						metadata->watch_impl = forward(watchWaitForValueChange(self, span.context, key), metadata->versionPromise);
+						self->actors.add(watchValueSendReply(self, req, metadata->versionPromise.getFuture(), span.context));
+					} else {
+						req.reply.send(WatchValueReply{ latest });
+					}
+					break;
+				} catch (Error& e) {
+					if( e.code() != error_code_transaction_too_old ) {
+						if(!canReplyWith(e)) throw e;
+						self->sendErrorWithPenalty(req.reply, e, self->getPenalty());
+						break;
+					}
+					TEST(true); // Reading a watched key failed with transaction_too_old case 5
+				}
+			}
+		}
+	}
+}
+
 ACTOR Future<Void> serveWatchValueRequests( StorageServer* self, FutureStream<WatchValueRequest> watchValue ) {
+	state PromiseStream<WatchValueRequest> stream;
+	self->actors.add(serveWatchValueRequestsImpl(self, stream.getFuture()));
+
 	loop {
 		WatchValueRequest req = waitNext(watchValue);
 		// TODO: fast load balancing?
-		// SOMEDAY: combine watches for the same key/value into a single watch
-		self->actors.add(self->readGuard(req, watchValueQ));
+		if(self->shouldRead(req)) {
+			self->actors.add(watchValueWaitForVersion(self, req, stream));
+		}
 	}
 }
 

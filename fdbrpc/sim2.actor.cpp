@@ -24,6 +24,10 @@
 #include <vector>
 
 #include "fdbrpc/simulator.h"
+#define BOOST_SYSTEM_NO_LIB
+#define BOOST_DATE_TIME_NO_LIB
+#define BOOST_REGEX_NO_LIB
+#include "fdbrpc/SimExternalConnection.h"
 #include "flow/ActorCollection.h"
 #include "flow/IRandom.h"
 #include "flow/IThreadPool.h"
@@ -96,18 +100,9 @@ void ISimulator::displayWorkers() const
 int openCount = 0;
 
 struct SimClogging {
-	double getSendDelay( NetworkAddress from, NetworkAddress to ) {
-		return halfLatency();
-		double tnow = now();
-		double t = tnow + halfLatency();
+	double getSendDelay(NetworkAddress from, NetworkAddress to) const { return halfLatency(); }
 
-		if (!g_simulator.speedUpSimulation && clogSendUntil.count( to.ip ))
-			t = std::max( t, clogSendUntil[ to.ip ] );
-
-		return t - tnow;
-	}
-
-	double getRecvDelay( NetworkAddress from, NetworkAddress to ) {
+	double getRecvDelay(NetworkAddress from, NetworkAddress to) {
 		auto pair = std::make_pair( from.ip, to.ip );
 
 		double tnow = now();
@@ -501,9 +496,7 @@ public:
 
 	std::string getFilename() const override { return actualFilename; }
 
-	~SimpleFile() {
-		_close( h );
-	}
+	~SimpleFile() override { _close(h); }
 
 private:
 	int h;
@@ -795,7 +788,7 @@ public:
 	TaskPriority getCurrentTask() const override { return currentTaskID; }
 	void setCurrentTask(TaskPriority taskID) override { currentTaskID = taskID; }
 	// Sets the taskID/priority of the current task, without yielding
-	Future<Reference<IConnection>> connect(NetworkAddress toAddr, std::string host) override {
+	Future<Reference<IConnection>> connect(NetworkAddress toAddr, const std::string &host) override {
 		ASSERT( host.empty());
 		if (!addressMap.count( toAddr )) {
 			return waitForProcessAndConnect( toAddr, this );
@@ -820,11 +813,15 @@ public:
 		return onConnect( ::delay(0.5*deterministicRandom()->random01()), myc );
 	}
 
+	Future<Reference<IConnection>> connectExternal(NetworkAddress toAddr, const std::string &host) override {
+		return SimExternalConnection::connect(toAddr);
+	}
+
 	Future<Reference<IUDPSocket>> createUDPSocket(NetworkAddress toAddr) override;
 	Future<Reference<IUDPSocket>> createUDPSocket(bool isV6 = false) override;
 
-  Future<std::vector<NetworkAddress>> resolveTCPEndpoint(std::string host, std::string service) override {
-		throw lookup_failed();
+	Future<std::vector<NetworkAddress>> resolveTCPEndpoint(const std::string &host, const std::string &service) override {
+		return SimExternalConnection::resolveTCPEndpoint(host, service);
 	}
 	ACTOR static Future<Reference<IConnection>> onConnect( Future<Void> ready, Reference<Sim2Conn> conn ) {
 		wait(ready);
@@ -1105,7 +1102,7 @@ public:
 		int nQuorum = ((desiredCoordinators+1)/2)*2-1;
 
 		KillType newKt = kt;
-		if ((kt == KillInstantly) || (kt == InjectFaults) || (kt == RebootAndDelete) || (kt == RebootProcessAndDelete))
+		if ((kt == KillInstantly) || (kt == InjectFaults) || (kt == FailDisk) || (kt == RebootAndDelete) || (kt == RebootProcessAndDelete))
 		{
 			LocalityGroup primaryProcessesLeft, primaryProcessesDead;
 			LocalityGroup primarySatelliteProcessesLeft, primarySatelliteProcessesDead;
@@ -1265,6 +1262,7 @@ public:
 		TEST( true ); // Simulated machine was killed with any kill type
 		TEST( kt == KillInstantly ); // Simulated machine was killed instantly
 		TEST( kt == InjectFaults ); // Simulated machine was killed with faults
+		TEST( kt == FailDisk ); // Simulated machine was killed with a failed disk
 
 		if (kt == KillInstantly) {
 			TraceEvent(SevWarn, "FailMachine")
@@ -1291,6 +1289,9 @@ public:
 			machine->fault_injection_r = deterministicRandom()->randomUniqueID().first();
 			machine->fault_injection_p1 = 0.1;
 			machine->fault_injection_p2 = deterministicRandom()->random01();
+		} else if (kt == FailDisk) {
+			TraceEvent(SevWarn, "FailDiskMachine").detail("Name", machine->name).detail("Address", machine->address).detail("ZoneId", machine->locality.zoneId()).detail("Process", machine->toString()).detail("Rebooting", machine->rebooting).detail("Protected", protectedAddresses.count(machine->address)).backtrace();
+			machine->failedDisk = true;
 		} else {
 			ASSERT( false );
 		}
@@ -1382,7 +1383,7 @@ public:
 		}
 
 		// Check if machine can be removed, if requested
-		if (!forceKill && ((kt == KillInstantly) || (kt == InjectFaults) || (kt == RebootAndDelete) || (kt == RebootProcessAndDelete)))
+		if (!forceKill && ((kt == KillInstantly) || (kt == InjectFaults) || (kt == FailDisk) || (kt == RebootAndDelete) || (kt == RebootProcessAndDelete)))
 		{
 			std::vector<ProcessInfo*> processesLeft, processesDead;
 			int	protectedWorker = 0, unavailable = 0, excluded = 0, cleared = 0;
@@ -1415,7 +1416,7 @@ public:
 			if (!canKillProcesses(processesLeft, processesDead, kt, &kt)) {
 				TraceEvent("ChangedKillMachine").detail("MachineId", machineId).detail("KillType", kt).detail("OrigKillType", ktOrig).detail("ProcessesLeft", processesLeft.size()).detail("ProcessesDead", processesDead.size()).detail("TotalProcesses", machines.size()).detail("ProcessesPerMachine", processesPerMachine).detail("Protected", protectedWorker).detail("Unavailable", unavailable).detail("Excluded", excluded).detail("Cleared", cleared).detail("ProtectedTotal", protectedAddresses.size()).detail("TLogPolicy", tLogPolicy->info()).detail("StoragePolicy", storagePolicy->info());
 			}
-			else if ((kt == KillInstantly) || (kt == InjectFaults)) {
+			else if ((kt == KillInstantly) || (kt == InjectFaults) || (kt == FailDisk)) {
 				TraceEvent("DeadMachine").detail("MachineId", machineId).detail("KillType", kt).detail("ProcessesLeft", processesLeft.size()).detail("ProcessesDead", processesDead.size()).detail("TotalProcesses", machines.size()).detail("ProcessesPerMachine", processesPerMachine).detail("TLogPolicy", tLogPolicy->info()).detail("StoragePolicy", storagePolicy->info());
 				for (auto process : processesLeft) {
 					TraceEvent("DeadMachineSurvivors").detail("MachineId", machineId).detail("KillType", kt).detail("ProcessesLeft", processesLeft.size()).detail("ProcessesDead", processesDead.size()).detail("SurvivingProcess", process->toString());
@@ -1455,7 +1456,7 @@ public:
 
 		TraceEvent("KillMachine").detail("MachineId", machineId).detail("Kt", kt).detail("KtOrig", ktOrig).detail("KillableMachines", processesOnMachine).detail("ProcessPerMachine", processesPerMachine).detail("KillChanged", kt!=ktOrig);
 		if ( kt < RebootAndDelete ) {
-			if(kt == InjectFaults && machines[machineId].machineProcess != nullptr)
+			if((kt == InjectFaults || kt == FailDisk) && machines[machineId].machineProcess != nullptr)
 				killProcess_internal( machines[machineId].machineProcess, kt );
 			for (auto& process : machines[machineId].processes) {
 				TraceEvent("KillMachineProcess").detail("KillType", kt).detail("Process", process->toString()).detail("StartingClass", process->startingClass.toString()).detail("Failed", process->failed).detail("Excluded", process->excluded).detail("Cleared", process->cleared).detail("Rebooting", process->rebooting);
@@ -1503,7 +1504,7 @@ public:
 		}
 
 		// Check if machine can be removed, if requested
-		if (!forceKill && ((kt == KillInstantly) || (kt == InjectFaults) || (kt == RebootAndDelete) || (kt == RebootProcessAndDelete)))
+		if (!forceKill && ((kt == KillInstantly) || (kt == InjectFaults) || (kt == FailDisk) || (kt == RebootAndDelete) || (kt == RebootProcessAndDelete)))
 		{
 			std::vector<ProcessInfo*>	processesLeft, processesDead;
 			for (auto processInfo : getAllProcesses()) {
@@ -1803,7 +1804,7 @@ public:
 		ASSERT(process->boundUDPSockets.find(localAddress) == process->boundUDPSockets.end());
 		process->boundUDPSockets.emplace(localAddress, this);
 	}
-	~UDPSimSocket() {
+	~UDPSimSocket() override {
 		if (!closed.getFuture().isReady()) {
 			close();
 			closed.send(Void());
@@ -1898,6 +1899,10 @@ public:
 
 	NetworkAddress localAddress() const override {
 		return _localAddress;
+	}
+
+	boost::asio::ip::udp::socket::native_handle_type native_handle() override {
+		return 0;
 	}
 
 };
@@ -1997,6 +2002,9 @@ ACTOR void doReboot( ISimulator::ProcessInfo *p, ISimulator::KillType kt ) {
 
 //Simulates delays for performing operations on disk
 Future<Void> waitUntilDiskReady( Reference<DiskParameters> diskParameters, int64_t size, bool sync ) {
+	if(g_simulator.getCurrentProcess()->failedDisk) {
+		return Never();
+	}
 	if(g_simulator.connectionFailuresDisableDuration > 1e4)
 		return delay(0.0001);
 
@@ -2036,8 +2044,7 @@ int sf_open( const char* filename, int flags, int convFlags, int mode ) {
 #endif
 
 // Opens a file for asynchronous I/O
-Future< Reference<class IAsyncFile> > Sim2FileSystem::open( std::string filename, int64_t flags, int64_t mode )
-{
+Future<Reference<class IAsyncFile>> Sim2FileSystem::open(const std::string& filename, int64_t flags, int64_t mode) {
 	ASSERT( (flags & IAsyncFile::OPEN_ATOMIC_WRITE_AND_CREATE) ||
 			!(flags & IAsyncFile::OPEN_CREATE) ||
 			StringRef(filename).endsWith(LiteralStringRef(".fdb-lock")) );  // We don't use "ordinary" non-atomic file creation right now except for folder locking, and we don't have code to simulate its unsafeness.
@@ -2074,12 +2081,11 @@ Future< Reference<class IAsyncFile> > Sim2FileSystem::open( std::string filename
 }
 
 // Deletes the given file.  If mustBeDurable, returns only when the file is guaranteed to be deleted even after a power failure.
-Future< Void > Sim2FileSystem::deleteFile( std::string filename, bool mustBeDurable )
-{
+Future<Void> Sim2FileSystem::deleteFile(const std::string& filename, bool mustBeDurable) {
 	return Sim2::deleteFileImpl(&g_sim2, filename, mustBeDurable);
 }
 
-Future< std::time_t > Sim2FileSystem::lastWriteTime( std::string filename ) {
+Future<std::time_t> Sim2FileSystem::lastWriteTime(const std::string& filename) {
 	// TODO: update this map upon file writes.
 	static std::map<std::string, double> fileWrites;
 	if (BUGGIFY && deterministicRandom()->random01() < 0.01) {

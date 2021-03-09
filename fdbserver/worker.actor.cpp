@@ -30,7 +30,7 @@
 #include "flow/TDMetric.actor.h"
 #include "fdbrpc/simulator.h"
 #include "fdbclient/NativeAPI.actor.h"
-#include "fdbserver/MetricLogger.h"
+#include "fdbserver/MetricLogger.actor.h"
 #include "fdbserver/BackupInterface.h"
 #include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/IKeyValueStore.h"
@@ -218,8 +218,7 @@ ACTOR Future<Void> workerHandleErrors(FutureStream<ErrorInfo> errors) {
 
 			endRole(err.role, err.id, "Error", ok, err.error);
 
-
-			if (err.error.code() == error_code_please_reboot || err.error.code() == error_code_io_timeout || (err.role == Role::SHARED_TRANSACTION_LOG && err.error.code() == error_code_io_error )) throw err.error;
+			if (err.error.code() == error_code_please_reboot || (err.role == Role::SHARED_TRANSACTION_LOG && (err.error.code() == error_code_io_error ||  err.error.code() == error_code_io_timeout))) throw err.error;
 		}
 	}
 }
