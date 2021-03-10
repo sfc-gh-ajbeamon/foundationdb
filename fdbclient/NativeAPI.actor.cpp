@@ -4150,6 +4150,79 @@ Future<Standalone<StringRef>> Transaction::getVersionstamp() {
 	return versionstampPromise.getFuture();
 }
 
+std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> getPeerProtocolAsyncVars(
+    Reference<ClusterConnectionFile> f) {
+	ClientCoordinators coord(f);
+
+	std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars;
+	peerProtocolAsyncVars.reserve(coord.clientLeaderServers.size());
+
+	for (int i = 0; i < coord.clientLeaderServers.size(); i++) {
+		Reference<AsyncVar<Optional<ProtocolVersion>>> protocolOptionalAsyncVar =
+		    FlowTransport::transport().getPeerProtocolAsyncVar(
+		        coord.clientLeaderServers[i].getLeader.getEndpoint().getPrimaryAddress());
+		peerProtocolAsyncVars.push_back(protocolOptionalAsyncVar);
+	}
+	return peerProtocolAsyncVars;
+}
+
+ACTOR Future<ProtocolVersion> waitConnectPacketVersions(
+    std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars) {
+	loop {
+		std::map<uint64_t, int> protocolCount;
+		for (int i = 0; i < peerProtocolAsyncVars.size(); ++i) {
+			if (peerProtocolAsyncVars[i]->get().present()) {
+				++protocolCount[peerProtocolAsyncVars[i]->get().get().version()];
+			}
+		}
+
+		if (protocolCount.size() > 0) {
+			auto maxElementItr =
+			    std::max_element(protocolCount.begin(),
+			                     protocolCount.end(),
+			                     [](const std::pair<uint64_t, int>& l, const std::pair<uint64_t, int>& r) {
+				                     return l.second < r.second;
+			                     });
+
+			if (maxElementItr->second >= peerProtocolAsyncVars.size() / 2 + 1) {
+				return ProtocolVersion(maxElementItr->first);
+			}
+		}
+
+		// if there is no protocol that a majority of coordinators agree on, wait for peerProtocolAsyncVars change
+		state vector<Future<Void>> peerProtocolVersionFutures;
+		peerProtocolVersionFutures.reserve(peerProtocolAsyncVars.size());
+
+		for (int i = 0; i < peerProtocolAsyncVars.size(); i++) {
+			peerProtocolVersionFutures.push_back(peerProtocolAsyncVars[i]->onChange());
+		}
+
+		wait(waitForAny(peerProtocolVersionFutures));
+	}
+}
+
+ACTOR Future<ProtocolVersion> getConnectPacketVersions(Reference<ClusterConnectionFile> f) {
+	std::vector<Reference<AsyncVar<Optional<ProtocolVersion>>>> peerProtocolAsyncVars = getPeerProtocolAsyncVars(f);
+	ProtocolVersion connectPacketVersion = wait(waitConnectPacketVersions(peerProtocolAsyncVars));
+	return connectPacketVersion;
+}
+
+ACTOR Future<uint64_t> getCoordinatorProtocols(Reference<ClusterConnectionFile> f,
+                                               Optional<ProtocolVersion> expectedProtocol) {
+	loop {
+		ProtocolVersion coordProtocol = wait(getConnectPacketVersions(f));
+
+		if (expectedProtocol.present()) {
+			if (expectedProtocol.get() != coordProtocol) {
+				return coordProtocol.version();
+			}
+			wait(delay(2.0)); // TODO: instead of polling, can we leave our connection open?
+		} else {
+			return coordProtocol.version();
+		}
+	}
+}
+
 uint32_t Transaction::getSize() {
 	auto s = tr.transaction.mutations.expectedSize() + tr.transaction.read_conflict_ranges.expectedSize() +
 	         tr.transaction.write_conflict_ranges.expectedSize();

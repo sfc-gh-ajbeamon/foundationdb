@@ -386,5 +386,8 @@ ACTOR Future<Void> snapCreate(Database cx, Standalone<StringRef> snapCmd, UID sn
 // Checks with Data Distributor that it is safe to mark all servers in exclusions as failed
 ACTOR Future<bool> checkSafeExclusions(Database cx, vector<AddressExclusion> exclusions);
 
+ACTOR Future<uint64_t> getCoordinatorProtocols(Reference<ClusterConnectionFile> f,
+                                               Optional<ProtocolVersion> expectedProtocol);
+
 #include "flow/unactorcompiler.h"
 #endif

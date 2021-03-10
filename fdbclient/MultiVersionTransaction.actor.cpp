@@ -762,30 +762,23 @@ MultiVersionDatabase::MultiVersionDatabase(MultiVersionApi* api,
                                            std::string clusterFilePath,
                                            Reference<IDatabase> db,
                                            bool openConnectors)
-  : dbState(new DatabaseState()) {
+  : dbState(new DatabaseState(clusterFilePath)) {
 	dbState->db = db;
 	dbState->dbVar->set(db);
 
-	if (!openConnectors) {
-		dbState->currentClientIndex = 0;
-	} else {
+	if (openConnectors) {
 		if (!api->localClientDisabled) {
-			dbState->currentClientIndex = 0;
-			dbState->addConnection(api->getLocalClient(), clusterFilePath);
-		} else {
-			dbState->currentClientIndex = -1;
+			dbState->addClient(api->getLocalClient());
 		}
 
-		api->runOnExternalClients(threadIdx, [this, clusterFilePath](Reference<ClientInfo> client) {
-			dbState->addConnection(client, clusterFilePath);
-		});
+		api->runOnExternalClients(threadIdx, [this](Reference<ClientInfo> client) { dbState->addClient(client); });
 
-		dbState->startConnections();
+		dbState->connect();
 	}
 }
 
 MultiVersionDatabase::~MultiVersionDatabase() {
-	dbState->cancelConnections();
+	dbState->close();
 }
 
 Reference<IDatabase> MultiVersionDatabase::debugCreateFromExistingDatabase(Reference<IDatabase> db) {
@@ -821,172 +814,101 @@ void MultiVersionDatabase::setOption(FDBDatabaseOptions::Option option, Optional
 	}
 }
 
-void MultiVersionDatabase::Connector::connect() {
-	addref();
-	onMainThreadVoid(
-	    [this]() {
-		    if (!cancelled) {
-			    connected = false;
-			    if (connectionFuture.isValid()) {
-				    connectionFuture.cancel();
-			    }
-
-			    candidateDatabase = client->api->createDatabase(clusterFilePath.c_str());
-			    if (client->external) {
-				    connectionFuture = candidateDatabase.castTo<DLDatabase>()->onReady();
-			    } else {
-				    connectionFuture = ThreadFuture<Void>(Void());
-			    }
-
-			    connectionFuture = flatMapThreadFuture<Void, Void>(connectionFuture, [this](ErrorOr<Void> ready) {
-				    if (ready.isError()) {
-					    return ErrorOr<ThreadFuture<Void>>(ready.getError());
-				    }
-
-				    tr = candidateDatabase->createTransaction();
-				    return ErrorOr<ThreadFuture<Void>>(
-				        mapThreadFuture<Version, Void>(tr->getReadVersion(), [](ErrorOr<Version> v) {
-					        // If the version attempt returns an error, we regard that as a connection (except
-					        // operation_cancelled)
-					        if (v.isError() && v.getError().code() == error_code_operation_cancelled) {
-						        return ErrorOr<Void>(v.getError());
-					        } else {
-						        return ErrorOr<Void>(Void());
-					        }
-				        }));
-			    });
-
-			    int userParam;
-			    connectionFuture.callOrSetAsCallback(this, userParam, 0);
-		    } else {
-			    delref();
-		    }
-	    },
-	    NULL);
-}
-
-// Only called from main thread
-void MultiVersionDatabase::Connector::cancel() {
-	connected = false;
-	cancelled = true;
-	if (connectionFuture.isValid()) {
-		connectionFuture.cancel();
+ACTOR Future<Void> monitorProtocolChanges(MultiVersionDatabase::DatabaseState* self) {
+	loop {
+		Reference<ClusterConnectionFile> ccf =
+		    Reference<ClusterConnectionFile>(new ClusterConnectionFile(self->clusterFilePath));
+		uint64_t version = wait(::getCoordinatorProtocols(ccf, self->currentProtocolVersion));
+		ProtocolVersion newProtocolVersion(version);
+		if (newProtocolVersion != currentProtocolVersion) {
+			self->protocolVersionChanged(newProtocolVersion);
+		}
 	}
 }
 
-void MultiVersionDatabase::Connector::fire(const Void& unused, int& userParam) {
-	onMainThreadVoid(
-	    [this]() {
-		    if (!cancelled) {
-			    connected = true;
-			    dbState->stateChanged();
-		    }
-		    delref();
-	    },
-	    NULL);
-}
+MultiVersionDatabase::DatabaseState::DatabaseState(std::string clusterFilePath)
+  : clusterFilePath(clusterFilePath), dbVar(new ThreadSafeAsyncVar<Reference<IDatabase>>(Reference<IDatabase>(NULL))) {}
 
-void MultiVersionDatabase::Connector::error(const Error& e, int& userParam) {
-	if (e.code() != error_code_operation_cancelled) {
-		// TODO: is it right to abandon this connection attempt?
-		client->failed = true;
+void MultiVersionDatabase::DatabaseState::addClient(Reference<ClientInfo> client) {
+	ProtocolVersion baseVersion = client->protocolVersion.baseVersion();
+	auto [itr, inserted] = clients.insert({ baseVersion, client });
+	if (!inserted) {
+		// SOMEDAY: prefer client with higher release version if protocol versions are compatible
+		Reference<ClientInfo> keptClient = itr->second;
+		Reference<ClientInfo> discardedClient = client;
+		if (client->canReplace(itr->second)) {
+			std::swap(keptClient, discardedClient);
+			clients[baseVersion] = client;
+		}
+
+		discardedClient->failed = true;
+		TraceEvent(SevWarn, "DuplicateClientVersion")
+		    .detail("Keeping", keptClient->libPath)
+		    .detail("KeptProtocolVersion", keptClient->protocolVersion)
+		    .detail("Disabling", discardedClient->libPath)
+		    .detail("DisabledProtocolVersion", discardedClient->protocolVersion);
+
 		MultiVersionApi::api->updateSupportedVersions();
-		TraceEvent(SevError, "DatabaseConnectionError").error(e).detail("ClientLibrary", this->client->libPath);
 	}
-
-	delref();
 }
 
-MultiVersionDatabase::DatabaseState::DatabaseState()
-  : dbVar(new ThreadSafeAsyncVar<Reference<IDatabase>>(Reference<IDatabase>(NULL))), currentClientIndex(-1) {}
+void MultiVersionDatabase::DatabaseState::connect() {
+	protocolVersionMonitor = monitorProtocolChanges(this);
+}
 
 // Only called from main thread
-void MultiVersionDatabase::DatabaseState::stateChanged() {
-	int newIndex = -1;
-	for (int i = 0; i < clients.size(); ++i) {
-		if (i != currentClientIndex && connectionAttempts[i]->connected) {
-			if (currentClientIndex >= 0 && !clients[i]->canReplace(clients[currentClientIndex])) {
-				TraceEvent(SevWarn, "DuplicateClientVersion")
-				    .detail("Keeping", clients[currentClientIndex]->libPath)
-				    .detail("KeptClientProtocolVersion", clients[currentClientIndex]->protocolVersion.version())
-				    .detail("Disabling", clients[i]->libPath)
-				    .detail("DisabledClientProtocolVersion", clients[i]->protocolVersion.version());
-				connectionAttempts[i]->connected = false; // Permanently disable this client in favor of the current one
-				clients[i]->failed = true;
+void MultiVersionDatabase::DatabaseState::protocolVersionChanged(ProtocolVersion protocolVersion) {
+	TraceEvent("ProtocolVersionChanged")
+	    .detail("NewProtocolVersion", protocolVersion)
+	    .detail("OldProtocolVersion", currentProtocolVersion);
+
+	currentProtocolVersion = protocolVersion.baseVersion();
+	auto itr = clients.find(currentProtocolVersion.get());
+
+	if (itr != clients.end()) {
+		auto& client = itr->second;
+		TraceEvent("CreatingDatabaseOnExternalClient")
+		    .detail("LibraryPath", client->libPath)
+		    .detail("Failed", client->failed);
+
+		Reference<IDatabase> newDb = client->api->createDatabase(clusterFilePath.c_str());
+
+		optionLock.enter();
+		for (auto option : options) {
+			try {
+				newDb->setOption(
+				    option.first,
+				    option.second.castTo<StringRef>()); // In practice, this will set a deferred error instead
+				                                        // of throwing. If that happens, the database will be
+				                                        // unusable (attempts to use it will throw errors).
+			} catch (Error& e) {
+				optionLock.leave();
+				TraceEvent(SevError, "ClusterVersionChangeOptionError")
+				    .error(e)
+				    .detail("Option", option.first)
+				    .detail("OptionValue", option.second)
+				    .detail("LibPath", client->libPath);
+				client->failed = true;
 				MultiVersionApi::api->updateSupportedVersions();
-				return;
+				db = Reference<IDatabase>(); // If we can't set all of the options on a cluster, we abandon the client
+				break;
 			}
-
-			newIndex = i;
-			break;
 		}
+
+		db = newDb;
+		optionLock.leave();
+	} else {
+		db = Reference<IDatabase>();
 	}
-
-	if (newIndex == -1) {
-		ASSERT_EQ(currentClientIndex, 0); // This can only happen for the local client, which we set as the current
-		                                  // connection before we know it's connected
-		return;
-	}
-
-	// Restart connection for replaced client
-	auto newDb = connectionAttempts[newIndex]->candidateDatabase;
-
-	optionLock.enter();
-	for (auto option : options) {
-		try {
-			newDb->setOption(option.first,
-			                 option.second.castTo<StringRef>()); // In practice, this will set a deferred error instead
-			                                                     // of throwing. If that happens, the database will be
-			                                                     // unusable (attempts to use it will throw errors).
-		} catch (Error& e) {
-			optionLock.leave();
-			TraceEvent(SevError, "ClusterVersionChangeOptionError")
-			    .error(e)
-			    .detail("Option", option.first)
-			    .detail("OptionValue", option.second)
-			    .detail("LibPath", clients[newIndex]->libPath);
-			connectionAttempts[newIndex]->connected = false;
-			clients[newIndex]->failed = true;
-			MultiVersionApi::api->updateSupportedVersions();
-			return; // If we can't set all of the options on a cluster, we abandon the client
-		}
-	}
-
-	db = newDb;
-	optionLock.leave();
 
 	dbVar->set(db);
-
-	if (currentClientIndex >= 0 && connectionAttempts[currentClientIndex]->connected) {
-		connectionAttempts[currentClientIndex]->connected = false;
-		connectionAttempts[currentClientIndex]->connect();
-	}
-
-	ASSERT(newIndex >= 0 && newIndex < clients.size());
-	currentClientIndex = newIndex;
 }
 
-void MultiVersionDatabase::DatabaseState::addConnection(Reference<ClientInfo> client, std::string clusterFilePath) {
-	clients.push_back(client);
-	connectionAttempts.push_back(
-	    Reference<Connector>(new Connector(Reference<DatabaseState>::addRef(this), client, clusterFilePath)));
-}
-
-void MultiVersionDatabase::DatabaseState::startConnections() {
-	for (auto c : connectionAttempts) {
-		c->connect();
-	}
-}
-
-void MultiVersionDatabase::DatabaseState::cancelConnections() {
+void MultiVersionDatabase::DatabaseState::close() {
 	addref();
+	// TODO: do we need this?
 	onMainThreadVoid(
 	    [this]() {
-		    for (auto c : connectionAttempts) {
-			    c->cancel();
-		    }
-
-		    connectionAttempts.clear();
 		    clients.clear();
 		    delref();
 	    },
@@ -1452,26 +1374,15 @@ Reference<IDatabase> MultiVersionApi::createDatabase(const char* clusterFilePath
 		int threadIdx = nextThread;
 		nextThread = (nextThread + 1) % threadCount;
 		lock.leave();
-		for (auto it : externalClients) {
-			TraceEvent("CreatingDatabaseOnExternalClient")
-			    .detail("LibraryPath", it.first)
-			    .detail("Failed", it.second[threadIdx]->failed);
-		}
 		return Reference<IDatabase>(new MultiVersionDatabase(this, threadIdx, clusterFile, Reference<IDatabase>()));
 	}
 
 	lock.leave();
 
-	auto db = localClient->api->createDatabase(clusterFilePath);
 	if (bypassMultiClientApi) {
-		return db;
+		return localClient->api->createDatabase(clusterFilePath);
 	} else {
-		for (auto it : externalClients) {
-			TraceEvent("CreatingDatabaseOnExternalClient")
-			    .detail("LibraryPath", it.first)
-			    .detail("Failed", it.second[0]->failed);
-		}
-		return Reference<IDatabase>(new MultiVersionDatabase(this, 0, clusterFile, db));
+		return Reference<IDatabase>(new MultiVersionDatabase(this, 0, clusterFile, Reference<IDatabase>()));
 	}
 }
 

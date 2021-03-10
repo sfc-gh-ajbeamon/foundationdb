@@ -141,6 +141,9 @@ struct Peer : public ReferenceCounted<Peer> {
 	double lastLoggedTime;
 	int64_t lastLoggedBytesReceived;
 	int64_t lastLoggedBytesSent;
+
+	Reference<AsyncVar<Optional<ProtocolVersion>>> protocolVersion;
+
 	// Cleared every time stats are logged for this peer.
 	int connectOutgoingCount;
 	int connectIncomingCount;
@@ -227,6 +230,8 @@ public:
 	                               bool openConnection); // { cancelReliable(sendReliable(what,destination)); }
 
 	bool incompatibleOutgoingConnectionsPresent();
+
+	Reference<AsyncVar<Optional<ProtocolVersion>>> getPeerProtocolAsyncVar(NetworkAddress addr);
 
 	static FlowTransport& transport() {
 		return *static_cast<FlowTransport*>((void*)g_network->global(INetwork::enFlowTransport));

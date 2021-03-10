@@ -737,6 +737,13 @@ ACTOR Future<Void> connectionKeeper(Reference<Peer> self,
 
 				conn->close();
 				conn = Reference<IConnection>();
+
+				// Old versions will throw this error, and we don't want to forget their protocol versions.
+				// This means we can't tell the difference between an old protocol version and one we
+				// can no longer connect to.
+				if (e.code() != error_code_incompatible_protocol_version) {
+					self->protocolVersion->set(Optional<ProtocolVersion>());
+				}
 			}
 
 			// Clients might send more packets in response, which needs to go out on the next connection
@@ -764,7 +771,8 @@ Peer::Peer(TransportData* transport, NetworkAddress const& destination)
     incompatibleProtocolVersionNewer(false), peerReferences(-1), bytesReceived(0), lastDataPacketSentTime(now()),
     pingLatencies(destination.isPublic() ? FLOW_KNOBS->PING_SAMPLE_AMOUNT : 1), lastLoggedBytesReceived(0),
     bytesSent(0), lastLoggedBytesSent(0), lastLoggedTime(0.0), connectOutgoingCount(0), connectIncomingCount(0),
-    connectFailedCount(0), connectLatencies(destination.isPublic() ? FLOW_KNOBS->NETWORK_CONNECT_SAMPLE_AMOUNT : 1) {
+    connectFailedCount(0), connectLatencies(destination.isPublic() ? FLOW_KNOBS->NETWORK_CONNECT_SAMPLE_AMOUNT : 1),
+    protocolVersion(Reference<AsyncVar<Optional<ProtocolVersion>>>(new AsyncVar<Optional<ProtocolVersion>>())) {
 	IFailureMonitor::failureMonitor().setStatus(destination, FailureStatus(false));
 }
 
@@ -803,8 +811,8 @@ void Peer::prependConnectPacket() {
 }
 
 void Peer::discardUnreliablePackets() {
-	// Throw away the current unsent list, dropping the reference count on each PacketBuffer that accounts for presence
-	// in the unsent list
+	// Throw away the current unsent list, dropping the reference count on each PacketBuffer that accounts for
+	// presence in the unsent list
 	unsent.discardAll();
 
 	// If there are reliable packets, compact reliable packets into a new unsent range
@@ -816,8 +824,8 @@ void Peer::discardUnreliablePackets() {
 }
 
 void Peer::onIncomingConnection(Reference<Peer> self, Reference<IConnection> conn, Future<Void> reader) {
-	// In case two processes are trying to connect to each other simultaneously, the process with the larger canonical
-	// NetworkAddress gets to keep its outgoing connection.
+	// In case two processes are trying to connect to each other simultaneously, the process with the larger
+	// canonical NetworkAddress gets to keep its outgoing connection.
 	++self->connectIncomingCount;
 	if (!destination.isPublic() && !outgoingConnectionIdle)
 		throw address_in_use();
@@ -1151,6 +1159,7 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 							if (!protocolVersion.hasMultiVersionClient()) {
 								// Older versions expected us to hang up. It may work even if we don't hang up here, but
 								// it's safer to keep the old behavior.
+								peer->protocolVersion->set(peerProtocolVersion);
 								throw incompatible_protocol_version();
 							}
 						} else {
@@ -1198,6 +1207,7 @@ ACTOR static Future<Void> connectionReader(TransportData* transport,
 							onConnected.send(peer);
 							wait(delay(0)); // Check for cancellation
 						}
+						peer->protocolVersion->set(peerProtocolVersion);
 					}
 				}
 				if (compatible) {
@@ -1601,6 +1611,10 @@ Reference<Peer> FlowTransport::sendUnreliable(ISerializeSource const& what,
 
 Reference<AsyncVar<bool>> FlowTransport::getDegraded() {
 	return self->degraded;
+}
+
+Reference<AsyncVar<Optional<ProtocolVersion>>> FlowTransport::getPeerProtocolAsyncVar(NetworkAddress addr) {
+	return self->peers.at(addr)->protocolVersion;
 }
 
 void FlowTransport::resetConnection(NetworkAddress address) {

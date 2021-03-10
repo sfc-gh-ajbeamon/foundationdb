@@ -393,52 +393,26 @@ public:
 
 	static Reference<IDatabase> debugCreateFromExistingDatabase(Reference<IDatabase> db);
 
-private:
-	struct DatabaseState;
-
-	struct Connector : ThreadCallback, ThreadSafeReferenceCounted<Connector> {
-		Connector(Reference<DatabaseState> dbState, Reference<ClientInfo> client, std::string clusterFilePath)
-		  : dbState(dbState), client(client), clusterFilePath(clusterFilePath), connected(false), cancelled(false) {}
-
-		void connect();
-		void cancel();
-
-		bool canFire(int notMadeActive) { return true; }
-		void fire(const Void& unused, int& userParam);
-		void error(const Error& e, int& userParam);
-
-		const Reference<ClientInfo> client;
-		const std::string clusterFilePath;
-
-		const Reference<DatabaseState> dbState;
-
-		ThreadFuture<Void> connectionFuture;
-
-		Reference<IDatabase> candidateDatabase;
-		Reference<ITransaction> tr;
-
-		bool connected;
-		bool cancelled;
-	};
-
+	// private:
 	struct DatabaseState : ThreadSafeReferenceCounted<DatabaseState> {
-		DatabaseState();
+		DatabaseState(std::string clusterFilePath);
 
-		void stateChanged();
-		void addConnection(Reference<ClientInfo> client, std::string clusterFilePath);
-		void startConnections();
-		void cancelConnections();
+		void protocolVersionChanged(ProtocolVersion protocolVersion);
+		void addClient(Reference<ClientInfo> client);
+		void connect();
+		void close();
 
 		Reference<IDatabase> db;
 		const Reference<ThreadSafeAsyncVar<Reference<IDatabase>>> dbVar;
+		std::string clusterFilePath;
 
 		ThreadFuture<Void> changed;
 
 		bool cancelled;
 
-		int currentClientIndex;
-		std::vector<Reference<ClientInfo>> clients;
-		std::vector<Reference<Connector>> connectionAttempts;
+		Future<Void> protocolVersionMonitor;
+		Optional<ProtocolVersion> currentProtocolVersion;
+		std::map<ProtocolVersion, Reference<ClientInfo>> clients;
 
 		std::vector<std::pair<FDBDatabaseOptions::Option, Optional<Standalone<StringRef>>>> options;
 		UniqueOrderedOptionList<FDBTransactionOptions> transactionDefaultOptions;
